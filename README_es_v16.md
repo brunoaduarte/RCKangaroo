@@ -4,7 +4,7 @@ Implementación de *Kangaroo ECDLP* acelerada por GPU con varias mejoras
 orientadas a **tiempo de cómputo** y **uso de memoria / I/O**.
 
 > Probado con CUDA 12.x y NVIDIA RTX 3060 (SM 8.6).  
-> Esta rama mantiene la **CLI original** y añade banderas/guías para *tame tuning* y *benchmarks*.
+> Esta rama mantiene la **CLI original** y añade banderas/guías para *tame tuning* y *benchmarks*
 
 
 ## Novedades técnicas (V1.5)
