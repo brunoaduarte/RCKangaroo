@@ -31,6 +31,7 @@ EcInt Int_TameOffset;
 Ec ec;
 
 CriticalSection csAddPoints;
+CriticalSection csCheckpoints;
 u8* pPntList;
 u8* pPntList2;
 volatile int PntIndex;
@@ -54,6 +55,62 @@ char gTamesFileName[1024];
 double gMax;
 bool gGenMode; //tames generation mode
 bool gIsOpsLimit;
+
+bool gSaveCheckpoints = false;
+std::string gClientID;
+std::string gSoftVersion = "3.52";
+int gLastCheckpointDay = -1;
+std::string gRawParams;
+#include <ctime>
+#include <cstdio>
+#include <string>
+#include <sstream>
+#include <iomanip>
+#include <functional>
+#include <fstream>
+#include <vector>
+
+#ifdef _WIN32
+#include <io.h>
+#include <windows.h>
+#else
+#include <unistd.h>
+#include <limits.h>
+#endif
+
+char gCheckpointFileName[1024] = {0};
+static std::vector<std::string> gPoolCheckpoints;
+static size_t gSavedLines = 0;
+std::string gMachineId;
+std::string gMachineIdHash4;
+std::string gParamsHash4;
+
+void InitMachineIdHash();
+void InitParamsHash();
+
+static inline uint32_t FNV1a16(const std::string &s)
+{
+	uint32_t h = 2166136261u;
+	for (unsigned char c : s)
+	{
+		h ^= c;
+		h *= 16777619u;
+	}
+	return h & 0xFFFFu;
+}
+
+static inline std::string Norm(std::string v)
+{
+	for (auto &ch : v)
+	{
+		if (ch == '\\')
+			ch = '/';
+		ch = (char)std::tolower((unsigned char)ch);
+	}
+	return v;
+}
+
+//
 
 #pragma pack(push, 1)
 struct DBRec
@@ -188,6 +245,154 @@ bool Collision_SOTA(EcPoint& pnt, EcInt t, int TameType, EcInt w, int WildType, 
 	}
 }
 
+void AddCheckpointsToList(u8 *pPntList2, int cnt)
+{
+	csCheckpoints.Enter();
+	gPoolCheckpoints.reserve(gPoolCheckpoints.size() + cnt);
+	for (int i = 0; i < cnt; ++i)
+	{
+		u8 *p = pPntList2 + i * GPU_DP_SIZE;
+		char buf[105];
+		for (int j = 0; j < 12; ++j)
+			sprintf(buf + j * 2, "%02x", p[11 - j]);
+		buf[24] = ' ';
+		u8 d[24];
+		for (int j = 0; j < 24; ++j)
+			d[j] = p[16 + j];
+		if ((d[23] & 0xF0) == 0xF0)
+		{
+			u8 result[24];
+			int borrow = 0;
+			for (int k = 0; k < 24; ++k)
+			{
+				int sub = 0xFF - d[k] - borrow;
+				if (sub < 0)
+				{
+					sub += 0x100;
+					borrow = 1;
+				}
+				else
+				{
+					borrow = 0;
+				}
+				result[k] = sub;
+			}
+			borrow = 1;
+			for (int k = 0; k < 24; ++k)
+			{
+				int sum = result[k] + borrow;
+				result[k] = sum & 0xFF;
+				borrow = (sum > 0xFF) ? 1 : 0;
+			}
+			for (int k = 0; k < 24; ++k)
+				d[k] = result[k];
+		}
+		for (int j = 0; j < 8; ++j)
+			sprintf(buf + 25 + j * 2, "00");
+		for (int j = 0; j < 24; ++j)
+			sprintf(buf + 41 + j * 2, "%02x", d[23 - j]);
+		int type = p[40];
+		snprintf(buf + 25 + 64, 16, " TYPE:%d", type);
+		gPoolCheckpoints.emplace_back(buf);
+	}
+	csCheckpoints.Leave();
+}
+
+void GenerateCheckpointFileName()
+{
+	time_t now = time(nullptr);
+	struct tm *t = localtime(&now);
+	char datebuf[9];
+	snprintf(datebuf, sizeof(datebuf), "%02d-%02d-%02d",
+			 t->tm_mday, t->tm_mon + 1, (t->tm_year + 1900) % 100);
+
+	snprintf(gCheckpointFileName, sizeof(gCheckpointFileName),
+			 "CHECKPOINTS.%s.%s.%s.%s.TXT",
+			 datebuf,
+			 gClientID.c_str(),
+			 gMachineIdHash4.c_str(),
+			 gParamsHash4.c_str());
+}
+
+void SaveInitialParamsToFile()
+{
+	std::ifstream check(gCheckpointFileName);
+	if (check.good())
+		return;
+	FILE *f = fopen(gCheckpointFileName, "a");
+	if (f)
+	{
+		fprintf(f, "%s\n", gRawParams.c_str());
+		fclose(f);
+	}
+	else
+	{
+		printf("Error: cannot create initial checkpoint file.\n");
+	}
+}
+
+void SaveCheckpointToFile()
+{
+	csCheckpoints.Enter();
+
+	size_t total = gPoolCheckpoints.size();
+	if (gSavedLines >= total)
+	{
+		csCheckpoints.Leave();
+		return;
+	}
+
+	FILE *f = fopen(gCheckpointFileName, "a");
+	if (!f)
+	{
+		csCheckpoints.Leave();
+		printf("Error: cannot open checkpoint file for appending.\n");
+		return;
+	}
+
+	const size_t oldSaved = gSavedLines;
+	size_t i = gSavedLines;
+
+	for (; i < total; ++i)
+	{
+		const std::string &line = gPoolCheckpoints[i];
+		if (!line.empty())
+		{
+			size_t w = fwrite(line.data(), 1, line.size(), f);
+			if (w != line.size())
+				break;
+		}
+		if (fputc('\n', f) == EOF)
+			break;
+	}
+
+	int ok = fflush(f);
+#ifdef _WIN32
+	if (ok == 0)
+		ok = _commit(_fileno(f));
+#else
+	if (ok == 0)
+		ok = fsync(fileno(f));
+#endif
+	fclose(f);
+
+	if (ok == 0 && i == total)
+	{
+		gSavedLines = 0;
+		gPoolCheckpoints.clear();
+		gPoolCheckpoints.shrink_to_fit();
+	}
+	else
+	{
+		gSavedLines = i;
+		if (i == oldSaved)
+			printf("Error: failed to write checkpoint lines to file.\n");
+		else
+			printf("Warning: partial write (%zu/%zu new lines).\n", i - oldSaved, total - oldSaved);
+	}
+
+	csCheckpoints.Leave();
+}
 
 void CheckNewPoints()
 {
@@ -202,6 +407,11 @@ void CheckNewPoints()
 	memcpy(pPntList2, pPntList, GPU_DP_SIZE * cnt);
 	PntIndex = 0;
 	csAddPoints.Leave();
+
+	if (gSaveCheckpoints)
+	{
+		AddCheckpointsToList(pPntList2, cnt);
+	}
 
 	for (int i = 0; i < cnt; i++)
 	{
@@ -289,6 +499,23 @@ void ShowStats(u64 tm_start, double exp_ops, double dp_val)
 	}
 #endif
 
+	if (gSaveCheckpoints)
+	{
+		time_t now = time(nullptr);
+		struct tm *tmNow = localtime(&now);
+		int day = tmNow->tm_mday;
+		if (day != gLastCheckpointDay)
+		{
+			gLastCheckpointDay = day;
+			GenerateCheckpointFileName();
+			SaveInitialParamsToFile();
+		}
+	}
+	if (gSaveCheckpoints)
+	{
+		SaveCheckpointToFile();
+	}
+
 	int speed = GpuKangs[0]->GetStatsSpeed();
 	for (int i = 1; i < GpuCnt; i++)
 		speed += GpuKangs[i]->GetStatsSpeed();
@@ -298,15 +525,28 @@ void ShowStats(u64 tm_start, double exp_ops, double dp_val)
 	if (speed)
 		exp_sec = (u64)((exp_ops / 1000000) / speed); //in sec
 	u64 exp_days = exp_sec / (3600 * 24);
-	int exp_hours = (int)(exp_sec - exp_days * (3600 * 24)) / 3600;
-	int exp_min = (int)(exp_sec - exp_days * (3600 * 24) - exp_hours * 3600) / 60;
+	u64 exp_hours = (exp_sec % (3600 * 24)) / 3600;
+	u64 exp_min = (exp_sec % 3600) / 60;
 
-	u64 sec = (GetTickCount64() - tm_start) / 1000;
-	u64 days = sec / (3600 * 24);
-	int hours = (int)(sec - days * (3600 * 24)) / 3600;
-	int min = (int)(sec - days * (3600 * 24) - hours * 3600) / 60;
-	 
-	printf("%sSpeed: %d MKeys/s, Err: %d, DPs: %lluK/%lluK, Time: %llud:%02dh:%02dm/%llud:%02dh:%02dm\r\n", gGenMode ? "GEN: " : (IsBench ? "BENCH: " : "MAIN: "), speed, gTotalErrors, db.GetBlockCnt()/1000, est_dps_cnt/1000, days, hours, min, exp_days, exp_hours, exp_min);
+	u64 exp_years = exp_days / 365;
+	u64 rem_days = exp_days % 365;
+
+	u64 elapsed_sec = (GetTickCount64() - tm_start) / 1000;
+	u64 days = elapsed_sec / 86400;
+	u64 hours = (elapsed_sec % 86400) / 3600;
+	u64 min = (elapsed_sec % 3600) / 60;
+	u64 sec = elapsed_sec % 60;
+
+	const char *mode_str = gGenMode	 ? "GEN: "
+						   : IsBench ? "BENCH: "
+									 : "MAIN: ";
+
+	printf("\n%s\n", mode_str);
+	printf("%-8s%d MKeys/s, Err: %d\n", "Speed:", speed, gTotalErrors);
+	printf("%-8s%llu / %llu\n", "DPs:", db.GetBlockCnt(), est_dps_cnt);
+	printf("%-8s%llud:%02lluh:%02llum:%02llus / %lluy:%llud:%02lluh:%02llum\n", "Time:",
+		   days, hours, min, sec,
+		   exp_years, rem_days, exp_hours, exp_min);
 }
 
 bool SolvePoint(EcPoint PntToSolve, int Range, int DP, EcInt* pk_res)
@@ -462,7 +702,7 @@ bool SolvePoint(EcPoint PntToSolve, int Range, int DP, EcInt* pk_res)
 			break;
 		}
 	}
-
+	ShowStats(tm0, ops, dp_val);
 	printf("Stopping work ...\r\n");
 	for (int i = 0; i < GpuCnt; i++)
 		GpuKangs[i]->Stop();
@@ -589,12 +829,71 @@ bool ParseCommandLine(int argc, char* argv[])
 			}
 			gMax = val;
 		}
+		else if (strcmp(argument, "-nodeID") == 0)
+		{
+			if (ci >= argc)
+			{
+				printf("error: missing value after -nodeID option\n");
+				return false;
+			}
+			std::string id = argv[ci++];
+
+			if (id.empty() || id[0] != '@')
+			{
+				printf("error: nodeID must start with '@' (example: @Worker)\n");
+				return false;
+			}
+
+			if (id.length() > 20)
+			{
+				printf("error: nodeID length must not exceed 20 characters\n");
+				return false;
+			}
+
+			for (size_t i = 1; i < id.size(); ++i)
+			{
+				if (!std::isalnum(static_cast<unsigned char>(id[i])) && id[i] != '_')
+				{
+					printf("error: nodeID must contain only letters, digits or '_' after '@'\n");
+					return false;
+				}
+			}
+
+			gClientID = id;
+			gSaveCheckpoints = true;
+		}
+
 		else
 		{
 			printf("error: unknown option %s\r\n", argument);
 			return false;
 		}
 	}
+
+	if (gSaveCheckpoints)
+	{
+		printf("Checkpoint saving mode is enabled.\n");
+		gRawParams.clear();
+		for (int i = 1; i < argc; ++i)
+		{
+			if (strcmp(argv[i], "-dp") == 0 ||
+				strcmp(argv[i], "-range") == 0 ||
+				strcmp(argv[i], "-start") == 0 ||
+				strcmp(argv[i], "-pubkey") == 0)
+			{
+				if (!gRawParams.empty())
+					gRawParams += " ";
+				gRawParams += argv[i];
+				if ((i + 1) < argc)
+				{
+					gRawParams += " ";
+					gRawParams += argv[i + 1];
+					++i;
+				}
+			}
+		}
+	}
+
 	if (!gPubKey.x.IsZero())
 		if (!gStartSet || !gRange || !gDP)
 		{
@@ -610,21 +909,105 @@ bool ParseCommandLine(int argc, char* argv[])
 		}
 		gGenMode = true;
 	}
+	if (gSaveCheckpoints && gDP < 18)
+	{
+		printf("Error: to save checkpoints DP should be more than 18\n");
+		return false;
+	}
 	return true;
 }
 
-int main(int argc, char* argv[])
+void InitMachineIdHash()
 {
-#ifdef _DEBUG	
+	std::string exePath;
+#ifdef _WIN32
+	{
+		char buf[MAX_PATH];
+		DWORD len = GetModuleFileNameA(NULL, buf, MAX_PATH);
+		if (len > 0)
+			exePath.assign(buf, len);
+	}
+#else
+	{
+		char buf[PATH_MAX];
+		ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+		if (len > 0)
+		{
+			buf[len] = '\0';
+			exePath.assign(buf);
+		}
+	}
+#endif
+	exePath = Norm(exePath);
+	std::string gpuFP;
+	int gcnt = 0;
+	if (cudaGetDeviceCount(&gcnt) == cudaSuccess && gcnt > 0)
+	{
+		for (int i = 0; i < gcnt; ++i)
+		{
+			cudaDeviceProp dp{};
+			if (cudaGetDeviceProperties(&dp, i) != cudaSuccess)
+				continue;
+#if defined(CUDART_VERSION) && (CUDART_VERSION >= 10000)
+			const unsigned char *u = reinterpret_cast<const unsigned char *>(&dp.uuid);
+			char ubuf[33];
+			for (int k = 0; k < 16; ++k)
+				sprintf(ubuf + k * 2, "%02x", u[k]);
+			gpuFP += "|gpu" + std::to_string(i) + "=" + std::string(ubuf, 32);
+#else
+			gpuFP += "|gpu" + std::to_string(i) + "=" + std::string(dp.name) + ":" + std::to_string(dp.pciBusID) + ":" + std::to_string((unsigned long long)dp.totalGlobalMem);
+#endif
+		}
+	}
+
+	std::string material = Norm(gMachineId) + "|" + exePath + gpuFP;
+	const uint32_t mh = FNV1a16(material);
+	std::ostringstream oss;
+	oss << std::hex << std::nouppercase << std::setw(4) << std::setfill('0') << mh;
+	gMachineIdHash4 = oss.str();
+
+	// DEBUG DUMP (remove after check)
+	{
+		std::string host = Norm(gMachineId);
+		// printf("[MachineHash] host: '%s'\n", host.c_str());
+		// printf("[MachineHash] exePath: '%s'\n", exePath.c_str());
+		// printf("[MachineHash] gpuFP: '%s'\n", gpuFP.c_str());
+		// printf("[MachineHash] material: '%s'\n", material.c_str());
+		// printf("[MachineHash] hash: %s\n", gMachineIdHash4.c_str());
+	}
+}
+
+void InitParamsHash()
+{
+	char hx[65] = {0}, hy[65] = {0}, hs[129] = {0};
+	gPubKey.x.GetHexStr(hx);
+	gPubKey.y.GetHexStr(hy);
+	gStart.GetHexStr(hs);
+	const std::string X = Norm(hx);
+	const std::string Y = Norm(hy);
+	const std::string S = Norm(hs);
+	std::string toHash = "dp=" + std::to_string(gDP) + "|range=" + std::to_string(gRange) + "|start=" + S + "|x=" + X + "|y=" + Y;
+	const uint32_t ph = FNV1a16(toHash);
+	std::ostringstream oss;
+	oss << std::hex << std::nouppercase << std::setw(4) << std::setfill('0') << ph;
+	gParamsHash4 = oss.str();
+}
+
+int main(int argc, char *argv[])
+{
+#ifdef _DEBUG
 	_CrtSetDbgFlag(_CRTDBG_ALLOC_MEM_DF | _CRTDBG_LEAK_CHECK_DF);
 #endif
 
 	printf("********************************************************************************\r\n");
-	printf("*                    RCKangaroo v3.0  (c) 2024 RetiredCoder                    *\r\n");
+	printf("*                                                                              *\r\n");
+	printf("*                         Kangaroo v%-4s(c) 2025                               *\r\n", gSoftVersion.c_str());
+	printf("*                                POOL MODE                                     *\r\n");
+	printf("*                                                                              *\r\n");
 	printf("********************************************************************************\r\n\r\n");
 
-	printf("This software is free and open-source: https://github.com/RetiredC\r\n");
-	printf("It demonstrates fast GPU implementation of SOTA Kangaroo method for solving ECDLP\r\n");
+	// printf("This software is free and open-source: https://github.com/RetiredC\r\n");
+	// printf("It demonstrates fast GPU implementation of SOTA Kangaroo method for solving ECDLP\r\n");
 
 #ifdef _WIN32
 	printf("Windows version\r\n");
@@ -655,6 +1038,13 @@ int main(int argc, char* argv[])
 		printf("No supported GPUs detected, exit\r\n");
 		return 0;
 	}
+
+	const char *name = getenv("COMPUTERNAME");
+	if (!name)
+		name = getenv("HOSTNAME");
+	gMachineId = name ? name : "";
+	InitMachineIdHash();
+	InitParamsHash();
 
 	pPntList = (u8*)malloc(MAX_CNT_LIST * GPU_DP_SIZE);
 	pPntList2 = (u8*)malloc(MAX_CNT_LIST * GPU_DP_SIZE);
