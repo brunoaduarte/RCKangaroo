@@ -7,6 +7,11 @@
 #include <iostream>
 #include <vector>
 #include <deque>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <atomic>
+#include <chrono>
 
 #include "cuda_runtime.h"
 #include "cuda.h"
@@ -59,7 +64,7 @@ bool gIsOpsLimit;
 
 bool gSaveCheckpoints = false;
 std::string gClientID;
-std::string gSoftVersion = "3.52";
+std::string gSoftVersion = "3.52-autosend";
 int gLastCheckpointDay = -1;
 std::string gRawParams;
 #include <ctime>
@@ -88,14 +93,21 @@ std::string gMachineIdHash4;
 std::string gParamsHash4;
 std::string gPoolAddress;
 
-struct RemoteCheckpointLine
+struct RemoteCheckpointBatch
 {
 	std::string filename;
-	std::string line;
+	std::vector<std::string> lines;
 };
 
-static std::deque<RemoteCheckpointLine> gPendingRemote;
+// --- Remote sender (async, retry-until-success) ---
+static std::deque<RemoteCheckpointBatch> gPendingRemote;
 static bool gCurlInitialized = false;
+
+static std::mutex gRemoteMtx;
+static std::condition_variable gRemoteCv;
+static std::thread gRemoteThread;
+static std::atomic<bool> gRemoteStop{false};
+static std::atomic<bool> gRemoteStarted{false};
 
 static void CurlGlobalCleanup()
 {
@@ -137,21 +149,11 @@ static std::string JsonEscape(const std::string &input)
 	{
 		switch (c)
 		{
-		case '\\':
-			out += "\\\\";
-			break;
-		case '\"':
-			out += "\\\"";
-			break;
-		case '\n':
-			out += "\\n";
-			break;
-		case '\r':
-			out += "\\r";
-			break;
-		case '\t':
-			out += "\\t";
-			break;
+		case '\\': out += "\\\\"; break;
+		case '\"': out += "\\\""; break;
+		case '\n': out += "\\n"; break;
+		case '\r': out += "\\r"; break;
+		case '\t': out += "\\t"; break;
 		default:
 			if (c < 0x20)
 			{
@@ -167,7 +169,7 @@ static std::string JsonEscape(const std::string &input)
 	return out;
 }
 
-static bool SendRemoteLine(const RemoteCheckpointLine &entry)
+static bool SendRemoteBatch(const RemoteCheckpointBatch &batch)
 {
 	if (!EnsureCurlInitialized())
 		return false;
@@ -179,7 +181,19 @@ static bool SendRemoteLine(const RemoteCheckpointLine &entry)
 		return false;
 	}
 
-	std::string payload = std::string("{\"filename\":\"") + JsonEscape(entry.filename) + "\",\"line\":\"" + JsonEscape(entry.line) + "\"}";
+	std::string payload;
+	payload.reserve(64 + batch.filename.size() + batch.lines.size() * 80);
+	payload += "{\"filename\":\"";
+	payload += JsonEscape(batch.filename);
+	payload += "\",\"lines\":[";
+	for (size_t i = 0; i < batch.lines.size(); ++i)
+	{
+		if (i) payload += ",";
+		payload += "\"";
+		payload += JsonEscape(batch.lines[i]);
+		payload += "\"";
+	}
+	payload += "]}";
 
 	struct curl_slist *headers = nullptr;
 	headers = curl_slist_append(headers, "Content-Type: application/json");
@@ -188,7 +202,12 @@ static bool SendRemoteLine(const RemoteCheckpointLine &entry)
 	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 	curl_easy_setopt(curl, CURLOPT_POSTFIELDS, payload.c_str());
 	curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, payload.size());
-	curl_easy_setopt(curl, CURLOPT_TIMEOUT, 15L);
+	curl_easy_setopt(curl, CURLOPT_TIMEOUT, 60L);
+	curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30L);
+	curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+	curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
+	curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 30L);
+	curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 15L);
 	curl_easy_setopt(curl, CURLOPT_USERAGENT, "RCKangaroo/3.52");
 
 	CURLcode res = curl_easy_perform(curl);
@@ -214,26 +233,88 @@ static bool SendRemoteLine(const RemoteCheckpointLine &entry)
 	return true;
 }
 
-static void TryFlushRemoteQueue()
+// Background loop: do not drop items on failure; retry with backoff until success or stop requested.
+static void RemoteSenderLoop()
 {
-	if (gPoolAddress.empty())
-		return;
+	int backoff_ms = 1000;
+	const int backoff_ms_max = 60000;
 
-	while (!gPendingRemote.empty())
+	while (!gRemoteStop.load(std::memory_order_relaxed))
 	{
-		if (!SendRemoteLine(gPendingRemote.front()))
-			break;
-		gPendingRemote.pop_front();
+		RemoteCheckpointBatch current;
+
+		{
+			std::unique_lock<std::mutex> lk(gRemoteMtx);
+			gRemoteCv.wait(lk, []{
+				return gRemoteStop.load(std::memory_order_relaxed) || !gPendingRemote.empty();
+			});
+
+			if (gRemoteStop.load(std::memory_order_relaxed))
+				break;
+
+			if (!gPendingRemote.empty())
+				current = gPendingRemote.front();
+			else
+				continue;
+		}
+
+		const bool ok = SendRemoteBatch(current);
+		if (ok)
+		{
+			std::lock_guard<std::mutex> lk(gRemoteMtx);
+			if (!gPendingRemote.empty())
+				gPendingRemote.pop_front();
+			backoff_ms = 1000;
+			continue;
+		}
+
+		std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms));
+		backoff_ms = std::min(backoff_ms * 2, backoff_ms_max);
 	}
 }
 
-static void QueueRemoteLine(const std::string &filename, const std::string &line)
+static void StartRemoteSender()
 {
-	if (gPoolAddress.empty() || filename.empty())
+	if (!gPoolAddress.empty() && !gRemoteStarted.load())
+	{
+		gRemoteStop.store(false);
+		gRemoteThread = std::thread(RemoteSenderLoop);
+		gRemoteStarted.store(true);
+	}
+}
+
+static void StopRemoteSender()
+{
+	if (gRemoteStarted.load())
+	{
+		gRemoteStop.store(true);
+		gRemoteCv.notify_all();
+		if (gRemoteThread.joinable())
+			gRemoteThread.join();
+		gRemoteStarted.store(false);
+	}
+}
+
+// Enqueue new batch; removal happens ONLY after a successful send.
+static void QueueRemoteBatch(const std::string &filename, const std::vector<std::string> &lines)
+{
+	if (gPoolAddress.empty() || filename.empty() || lines.empty())
 		return;
 
-	gPendingRemote.push_back(RemoteCheckpointLine{filename, line});
+	{
+		std::lock_guard<std::mutex> lk(gRemoteMtx);
+		gPendingRemote.push_back(RemoteCheckpointBatch{filename, lines});
+	}
+	gRemoteCv.notify_one();
 }
+
+// Kept for compatibility with existing call sites; now it simply wakes the sender.
+static void TryFlushRemoteQueue()
+{
+	gRemoteCv.notify_one();
+}
+// --- end remote sender ---
+
 
 void InitMachineIdHash();
 void InitParamsHash();
@@ -486,7 +567,7 @@ void SaveInitialParamsToFile()
 		if (wrote && ok == 0)
 		{
 			csCheckpoints.Enter();
-			QueueRemoteLine(gCheckpointFileName, gRawParams);
+			QueueRemoteBatch(gCheckpointFileName, std::vector<std::string>{gRawParams});
 			TryFlushRemoteQueue();
 			csCheckpoints.Leave();
 		}
@@ -548,8 +629,7 @@ void SaveCheckpointToFile()
 
 	if (ok == 0 && !writtenLines.empty())
 	{
-		for (const std::string &line : writtenLines)
-			QueueRemoteLine(gCheckpointFileName, line);
+		QueueRemoteBatch(gCheckpointFileName, writtenLines);
 	}
 
 	if (ok == 0 && i == total)
@@ -873,7 +953,11 @@ bool SolvePoint(EcPoint PntToSolve, int Range, int DP, EcInt* pk_res)
 	while (!gSolved)
 	{
 		CheckNewPoints();
+#ifdef _WIN32
 		Sleep(10);
+#else
+		std::this_thread::sleep_for(std::chrono::milliseconds(10));
+#endif
 		if (GetTickCount64() - tm_stats > 10 * 1000)
 		{
 			ShowStats(tm0, ops, dp_val);
@@ -892,7 +976,13 @@ bool SolvePoint(EcPoint PntToSolve, int Range, int DP, EcInt* pk_res)
 	for (int i = 0; i < GpuCnt; i++)
 		GpuKangs[i]->Stop();
 	while (ThrCnt)
+	{
+#ifdef _WIN32
 		Sleep(10);
+#else
+		std::this_thread::sleep_for(std::chrono::milliseconds(10));
+#endif
+	}
 	for (int i = 0; i < GpuCnt; i++)
 	{
 #ifdef _WIN32
@@ -954,6 +1044,7 @@ bool ParseCommandLine(int argc, char* argv[])
 		else
 		if (strcmp(argument, "-dp") == 0)
 		{
+			if (ci >= argc) { printf("error: missed value after -dp option\r\n"); return false; }
 			int val = atoi(argv[ci]);
 			ci++;
 			if ((val < 14) || (val > 60))
@@ -966,6 +1057,7 @@ bool ParseCommandLine(int argc, char* argv[])
 		else
 		if (strcmp(argument, "-range") == 0)
 		{
+			if (ci >= argc) { printf("error: missed value after -range option\r\n"); return false; }
 			int val = atoi(argv[ci]);
 			ci++;
 			if ((val < 32) || (val > 170))
@@ -978,6 +1070,7 @@ bool ParseCommandLine(int argc, char* argv[])
 		else
 		if (strcmp(argument, "-start") == 0)
 		{	
+			if (ci >= argc) { printf("error: missed value after -start option\r\n"); return false; }
 			if (!gStart.SetHexStr(argv[ci]))
 			{
 				printf("error: invalid value for -start option\r\n");
@@ -989,6 +1082,7 @@ bool ParseCommandLine(int argc, char* argv[])
 		else
 		if (strcmp(argument, "-pubkey") == 0)
 		{
+			if (ci >= argc) { printf("error: missed value after -pubkey option\r\n"); return false; }
 			if (!gPubKey.SetHexStr(argv[ci]))
 			{
 				printf("error: invalid value for -pubkey option\r\n");
@@ -999,12 +1093,14 @@ bool ParseCommandLine(int argc, char* argv[])
 		else
 		if (strcmp(argument, "-tames") == 0)
 		{
+			if (ci >= argc) { printf("error: missed value after -tames option\r\n"); return false; }
 			strcpy(gTamesFileName, argv[ci]);
 			ci++;
 		}
 		else
 		if (strcmp(argument, "-max") == 0)
 		{
+			if (ci >= argc) { printf("error: missed value after -max option\r\n"); return false; }
 			double val = atof(argv[ci]);
 			ci++;
 			if (val < 0.001)
@@ -1234,11 +1330,15 @@ int main(int argc, char *argv[])
 	if (!ParseCommandLine(argc, argv))
 		return 0;
 
+	if (!gPoolAddress.empty())
+		StartRemoteSender();
+
 	InitGpus();
 
 	if (!GpuCnt)
 	{
 		printf("No supported GPUs detected, exit\r\n");
+		StopRemoteSender();
 		return 0;
 	}
 
@@ -1304,7 +1404,11 @@ int main(int argc, char *argv[])
 		{
 			printf("WARNING: Cannot save the key to RESULTS.TXT!\r\n");
 			while (1)
+#ifdef _WIN32
 				Sleep(100);
+#else
+				std::this_thread::sleep_for(std::chrono::milliseconds(100));
+#endif
 		}
 	}
 	else
@@ -1353,5 +1457,5 @@ label_end:
 	DeInitEc();
 	free(pPntList2);
 	free(pPntList);
+	StopRemoteSender();
 }
-
