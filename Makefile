@@ -4,7 +4,7 @@ CUDA_PATH ?= /usr/local/cuda
 
 CCFLAGS := -O3 -I$(CUDA_PATH)/include
 NVCCFLAGS := -O3 -gencode=arch=compute_120,code=compute_120
-LDFLAGS := -L$(CUDA_PATH)/lib64 -lcudart -pthread
+LDFLAGS := -L$(CUDA_PATH)/lib64 -lcudart -pthread -lcurl
 
 CPU_SRC := RCKangaroo.cpp GpuKang.cpp Ec.cpp utils.cpp
 GPU_SRC := RCGpuCore.cu
