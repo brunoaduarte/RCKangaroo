@@ -6,6 +6,7 @@
 
 #include <iostream>
 #include <vector>
+#include <deque>
 
 #include "cuda_runtime.h"
 #include "cuda.h"
@@ -69,6 +70,7 @@ std::string gRawParams;
 #include <functional>
 #include <fstream>
 #include <vector>
+#include <curl/curl.h>
 
 #ifdef _WIN32
 #include <io.h>
@@ -84,6 +86,154 @@ static size_t gSavedLines = 0;
 std::string gMachineId;
 std::string gMachineIdHash4;
 std::string gParamsHash4;
+std::string gPoolAddress;
+
+struct RemoteCheckpointLine
+{
+	std::string filename;
+	std::string line;
+};
+
+static std::deque<RemoteCheckpointLine> gPendingRemote;
+static bool gCurlInitialized = false;
+
+static void CurlGlobalCleanup()
+{
+	if (gCurlInitialized)
+	{
+		curl_global_cleanup();
+		gCurlInitialized = false;
+	}
+}
+
+static bool EnsureCurlInitialized()
+{
+	if (gPoolAddress.empty())
+		return false;
+
+	if (gCurlInitialized)
+		return true;
+
+	if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK)
+	{
+		printf("Error: failed to initialize cURL. Remote checkpoint sync disabled.\n");
+		return false;
+	}
+
+	if (atexit(CurlGlobalCleanup) != 0)
+	{
+		printf("Warning: failed to register cURL cleanup handler.\n");
+	}
+
+	gCurlInitialized = true;
+	return true;
+}
+
+static std::string JsonEscape(const std::string &input)
+{
+	std::string out;
+	out.reserve(input.size() + 8);
+	for (unsigned char c : input)
+	{
+		switch (c)
+		{
+		case '\\':
+			out += "\\\\";
+			break;
+		case '\"':
+			out += "\\\"";
+			break;
+		case '\n':
+			out += "\\n";
+			break;
+		case '\r':
+			out += "\\r";
+			break;
+		case '\t':
+			out += "\\t";
+			break;
+		default:
+			if (c < 0x20)
+			{
+				char buf[7];
+				sprintf(buf, "\\u%04x", c);
+				out += buf;
+			}
+			else
+				out += (char)c;
+			break;
+		}
+	}
+	return out;
+}
+
+static bool SendRemoteLine(const RemoteCheckpointLine &entry)
+{
+	if (!EnsureCurlInitialized())
+		return false;
+
+	CURL *curl = curl_easy_init();
+	if (!curl)
+	{
+		printf("Warning: cannot initialize cURL easy handle for checkpoint sync.\n");
+		return false;
+	}
+
+	std::string payload = std::string("{\"filename\":\"") + JsonEscape(entry.filename) + "\",\"line\":\"" + JsonEscape(entry.line) + "\"}";
+
+	struct curl_slist *headers = nullptr;
+	headers = curl_slist_append(headers, "Content-Type: application/json");
+
+	curl_easy_setopt(curl, CURLOPT_URL, gPoolAddress.c_str());
+	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+	curl_easy_setopt(curl, CURLOPT_POSTFIELDS, payload.c_str());
+	curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, payload.size());
+	curl_easy_setopt(curl, CURLOPT_TIMEOUT, 15L);
+	curl_easy_setopt(curl, CURLOPT_USERAGENT, "RCKangaroo/3.52");
+
+	CURLcode res = curl_easy_perform(curl);
+	long response_code = 0;
+	if (res == CURLE_OK)
+		curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
+
+	curl_slist_free_all(headers);
+	curl_easy_cleanup(curl);
+
+	if (res != CURLE_OK)
+	{
+		printf("Warning: failed to send checkpoint to pool (%s).\n", curl_easy_strerror(res));
+		return false;
+	}
+
+	if (response_code < 200 || response_code >= 300)
+	{
+		printf("Warning: pool server returned HTTP %ld while saving checkpoint.\n", response_code);
+		return false;
+	}
+
+	return true;
+}
+
+static void TryFlushRemoteQueue()
+{
+	if (gPoolAddress.empty())
+		return;
+
+	while (!gPendingRemote.empty())
+	{
+		if (!SendRemoteLine(gPendingRemote.front()))
+			break;
+		gPendingRemote.pop_front();
+	}
+}
+
+static void QueueRemoteLine(const std::string &filename, const std::string &line)
+{
+	if (gPoolAddress.empty() || filename.empty())
+		return;
+
+	gPendingRemote.push_back(RemoteCheckpointLine{filename, line});
+}
 
 void InitMachineIdHash();
 void InitParamsHash();
@@ -322,8 +472,24 @@ void SaveInitialParamsToFile()
 	FILE *f = fopen(gCheckpointFileName, "a");
 	if (f)
 	{
-		fprintf(f, "%s\n", gRawParams.c_str());
+		bool wrote = fprintf(f, "%s\n", gRawParams.c_str()) >= 0;
+		int ok = fflush(f);
+#ifdef _WIN32
+		if (ok == 0)
+			ok = _commit(_fileno(f));
+#else
+		if (ok == 0)
+			ok = fsync(fileno(f));
+#endif
 		fclose(f);
+
+		if (wrote && ok == 0)
+		{
+			csCheckpoints.Enter();
+			QueueRemoteLine(gCheckpointFileName, gRawParams);
+			TryFlushRemoteQueue();
+			csCheckpoints.Leave();
+		}
 	}
 	else
 	{
@@ -334,6 +500,7 @@ void SaveInitialParamsToFile()
 void SaveCheckpointToFile()
 {
 	csCheckpoints.Enter();
+	TryFlushRemoteQueue();
 
 	size_t total = gPoolCheckpoints.size();
 	if (gSavedLines >= total)
@@ -353,6 +520,8 @@ void SaveCheckpointToFile()
 	const size_t oldSaved = gSavedLines;
 	size_t i = gSavedLines;
 
+	std::vector<std::string> writtenLines;
+	writtenLines.reserve(total - i);
 	for (; i < total; ++i)
 	{
 		const std::string &line = gPoolCheckpoints[i];
@@ -364,6 +533,7 @@ void SaveCheckpointToFile()
 		}
 		if (fputc('\n', f) == EOF)
 			break;
+		writtenLines.push_back(line);
 	}
 
 	int ok = fflush(f);
@@ -375,6 +545,12 @@ void SaveCheckpointToFile()
 		ok = fsync(fileno(f));
 #endif
 	fclose(f);
+
+	if (ok == 0 && !writtenLines.empty())
+	{
+		for (const std::string &line : writtenLines)
+			QueueRemoteLine(gCheckpointFileName, line);
+	}
 
 	if (ok == 0 && i == total)
 	{
@@ -390,6 +566,9 @@ void SaveCheckpointToFile()
 		else
 			printf("Warning: partial write (%zu/%zu new lines).\n", i - oldSaved, total - oldSaved);
 	}
+
+	if (ok == 0 && !writtenLines.empty())
+		TryFlushRemoteQueue();
 
 	csCheckpoints.Leave();
 }
@@ -407,6 +586,12 @@ void CheckNewPoints()
 	memcpy(pPntList2, pPntList, GPU_DP_SIZE * cnt);
 	PntIndex = 0;
 	csAddPoints.Leave();
+
+	if (!gPoolAddress.empty() && !gSaveCheckpoints)
+	{
+		printf("error: --pool-address requires checkpoint saving mode (-nodeID)\n");
+		return;
+	}
 
 	if (gSaveCheckpoints)
 	{
@@ -829,6 +1014,22 @@ bool ParseCommandLine(int argc, char* argv[])
 			}
 			gMax = val;
 		}
+		
+		else if (strcmp(argument, "--pool-address") == 0)
+		{
+			if (ci >= argc)
+			{
+				printf("error: missing value after --pool-address option\n");
+				return false;
+			}
+			gPoolAddress = argv[ci++];
+			if (gPoolAddress.rfind("https://", 0) != 0)
+			{
+				printf("error: pool address must start with https://\n");
+				return false;
+			}
+		}
+		
 		else if (strcmp(argument, "-nodeID") == 0)
 		{
 			if (ci >= argc)
@@ -914,6 +1115,8 @@ bool ParseCommandLine(int argc, char* argv[])
 		printf("Error: to save checkpoints DP should be more than 18\n");
 		return false;
 	}
+	if (!gPoolAddress.empty())
+		printf("Remote pool synchronization enabled: %s\n", gPoolAddress.c_str());
 	return true;
 }
 
