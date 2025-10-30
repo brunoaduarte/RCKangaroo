@@ -2,17 +2,17 @@
 """Simple HTTPS-ready checkpoint append server.
 
 This script exposes an HTTP endpoint that accepts POST requests containing
-JSON payloads with the following shape::
+JSON payloads with either of the following shapes::
 
     {"filename": "CHECKPOINTS...TXT", "line": "..."}
 
-The provided line is appended (with a trailing newline) to a file matching the
-``filename`` in the local ``storage`` directory. The directory is created
-automatically if it does not already exist.
+or the new batched format::
 
-The handler performs a minimal validation step by collapsing the filename to a
-basename to avoid directory traversal and ensures the file lives underneath the
-``storage`` folder.
+    {"filename": "CHECKPOINTS...TXT", "lines": ["...", "...", "..."]}
+
+The provided line(s) are appended (each with a trailing newline) to a file
+matching ``filename`` in the local ``storage`` directory. The directory is
+created automatically if it does not already exist.
 
 Run with::
 
@@ -34,7 +34,7 @@ import ssl
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 
 STORAGE_DIR = Path("storage")
 
@@ -64,21 +64,43 @@ class AppendHandler(BaseHTTPRequestHandler):
             return
 
         filename = data.get("filename")
-        line = data.get("line")
         if not isinstance(filename, str) or not filename:
             self.send_error(HTTPStatus.BAD_REQUEST, "Missing filename field")
             return
-        if not isinstance(line, str):
-            self.send_error(HTTPStatus.BAD_REQUEST, "Missing line field")
+
+        # Accept legacy single-line payloads and new batched payloads
+        lines: List[str]
+        if "lines" in data:
+            lines_field = data.get("lines")
+            if not isinstance(lines_field, list) or not all(isinstance(x, str) for x in lines_field):
+                self.send_error(HTTPStatus.BAD_REQUEST, "Field 'lines' must be a list of strings")
+                return
+            lines = lines_field
+        elif "line" in data:
+            line = data.get("line")
+            if not isinstance(line, str):
+                self.send_error(HTTPStatus.BAD_REQUEST, "Missing line field")
+                return
+            lines = [line]
+        else:
+            self.send_error(HTTPStatus.BAD_REQUEST, "Missing 'line' or 'lines' field")
+            return
+
+        if not lines:
+            # Nothing to append; succeed with no content for idempotency.
+            self.send_response(HTTPStatus.NO_CONTENT)
+            self.end_headers()
             return
 
         safe_name = os.path.basename(filename)
         target_path = STORAGE_DIR / safe_name
         try:
             STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+            # Append all lines in one open/close to keep behavior atomic per request
             with target_path.open("a", encoding="utf-8") as fh:
-                fh.write(line)
-                fh.write("\n")
+                for l in lines:
+                    fh.write(l)
+                    fh.write("\n")
         except OSError as exc:  # pragma: no cover - filesystem failure path
             self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
             return
@@ -91,11 +113,12 @@ class AppendHandler(BaseHTTPRequestHandler):
         super().log_message(format, *args)
 		
     def log_request(self, code: object = "-", size: object = "-") -> None:
-        # Append the received body to the standard access log line
         body = getattr(self, "_raw_body", "")
-        body_one_line = " ".join(body.split())
-        self.log_message('"%s" %s %s %s', self.requestline, str(code), str(size), body_one_line)
-
+        try:
+            filename = json.loads(body).get("filename", "")
+        except Exception:
+            filename = ""
+        self.log_message('"%s" %s %s {"filename":"%s"}', self.requestline, str(code), str(size), filename)
 
 def build_server(host: str, port: int, cert: Optional[str], key: Optional[str]) -> HTTPServer:
     httpd = HTTPServer((host, port), AppendHandler)
