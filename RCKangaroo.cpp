@@ -533,9 +533,11 @@ void GenerateCheckpointFileName()
 {
 	time_t now = time(nullptr);
 	struct tm *t = localtime(&now);
-	char datebuf[9];
-	snprintf(datebuf, sizeof(datebuf), "%02d-%02d-%02d",
-			 t->tm_mday, t->tm_mon + 1, (t->tm_year + 1900) % 100);
+	char datebuf[12]; // enough for "dd-mm-yy" + NUL
+	if (strftime(datebuf, sizeof(datebuf), "%d-%m-%y", t) == 0) {
+		// Fallback (shouldn't happen with size 12)
+		snprintf(datebuf, sizeof(datebuf), "00-00-00");
+	}
 
 	snprintf(gCheckpointFileName, sizeof(gCheckpointFileName),
 			 "CHECKPOINTS.%s.%s.%s.%s.TXT",
