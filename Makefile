@@ -1,9 +1,11 @@
 CC := g++-9
-NVCC := /usr/local/cuda-12.8/bin/nvcc
-CUDA_PATH ?= /usr/local/cuda-12.8
+CUDA_VER ?= 12.8
+ARCH ?= 120
+CUDA_PATH ?= /usr/local/cuda-$(CUDA_VER)
+NVCC ?= $(CUDA_PATH)/bin/nvcc
 
 CCFLAGS := -O3 -I$(CUDA_PATH)/include
-NVCCFLAGS := -O3 -gencode=arch=compute_120,code=compute_120 -ccbin=/usr/bin/$(CC)
+NVCCFLAGS := -O3 -gencode=arch=compute_$(ARCH),code=compute_$(ARCH) -ccbin=/usr/bin/$(CC)
 LDFLAGS := -L$(CUDA_PATH)/lib64 -lcudart -pthread -lcurl
 
 CPU_SRC := RCKangaroo.cpp GpuKang.cpp Ec.cpp utils.cpp
