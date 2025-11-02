@@ -191,7 +191,12 @@ bool RCGpuKang::Prepare(EcPoint _PntToSolve, int _Range, int _DP, EcJMP* _EcJump
 		return false;
 	}
 
-	DPs_out = (u32*)malloc(MAX_DP_CNT * GPU_DP_SIZE);
+	err = cudaHostAlloc((void**)&DPs_out, MAX_DP_CNT * GPU_DP_SIZE, cudaHostAllocDefault);
+	if (err != cudaSuccess)
+	{
+		printf("GPU %d Allocate pinned DPs_out buffer failed: %s\n", CudaIndex, cudaGetErrorString(err));
+		return false;
+	}
 
 //jmp1
 	u64* buf = (u64*)malloc(JMP_CNT * 96);
@@ -258,7 +263,8 @@ bool RCGpuKang::Prepare(EcPoint _PntToSolve, int _Range, int _DP, EcJMP* _EcJump
 void RCGpuKang::Release()
 {
 	free(RndPnts);
-	free(DPs_out);
+	if (DPs_out)
+		cudaFreeHost(DPs_out);
 	cudaFree(Kparams.LoopedKangs);
 	cudaFree(Kparams.dbg_buf);
 	cudaFree(Kparams.LoopTable);

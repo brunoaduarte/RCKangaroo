@@ -10,6 +10,17 @@
 //imp2 table points for KernelA
 __device__ __constant__ u64 jmp2_table[8 * JMP_CNT];
 
+// Fast modulo helpers (use bitmask when compile-time power-of-two)
+#if ((JMP_CNT & (JMP_CNT - 1)) == 0)
+	#define FAST_MOD_JMP(x) ((x) & (JMP_CNT - 1))
+#else
+	#define FAST_MOD_JMP(x) ((x) % JMP_CNT)
+#endif
+#if ((MD_LEN & (MD_LEN - 1)) == 0)
+	#define FAST_MOD_MD(x) ((x) & (MD_LEN - 1))
+#else
+	#define FAST_MOD_MD(x) ((x) % MD_LEN)
+#endif
 
 #define BLOCK_CNT	gridDim.x
 #define BLOCK_X		blockIdx.x
@@ -30,11 +41,11 @@ extern __shared__ u64 LDS[];
 extern "C" __launch_bounds__(BLOCK_SIZE, 1)
 __global__ void KernelA(const TKparams Kparams)
 {
-	u64* L2x = Kparams.L2 + 2 * THREAD_X + 4 * BLOCK_SIZE * BLOCK_X;
-	u64* L2y = L2x + 4 * PNT_GROUP_CNT * BLOCK_CNT * BLOCK_SIZE;
-	u64* L2s = L2y + 4 * PNT_GROUP_CNT * BLOCK_CNT * BLOCK_SIZE;
+	u64* __restrict__ L2x = Kparams.L2 + 2 * THREAD_X + 4 * BLOCK_SIZE * BLOCK_X;
+	u64* __restrict__ L2y = L2x + 4 * PNT_GROUP_CNT * BLOCK_CNT * BLOCK_SIZE;
+	u64* __restrict__ L2s = L2y + 4 * PNT_GROUP_CNT * BLOCK_CNT * BLOCK_SIZE;
 	//list of distances of performed jumps for KernelB
-	int4* jlist = (int4*)(Kparams.JumpsList + (u64)BLOCK_X * STEP_CNT * PNT_GROUP_CNT * BLOCK_SIZE / 4);
+	int4* __restrict__ jlist = (int4*)(Kparams.JumpsList + (u64)BLOCK_X * STEP_CNT * PNT_GROUP_CNT * BLOCK_SIZE / 4);
 	jlist += (THREAD_X / 32) * 32 * PNT_GROUP_CNT / 8;
 	//list of last visited points for KernelC
 	u64* x_last0 = Kparams.LastPnts + 2 * THREAD_X + 4 * BLOCK_SIZE * BLOCK_X;
@@ -86,7 +97,7 @@ __global__ void KernelA(const TKparams Kparams)
 		
 		//first group
 		LOAD_VAL_256(x, L2x, 0);
-		jmp_ind = x[0] % JMP_CNT;
+		jmp_ind = FAST_MOD_JMP(x[0]);
 		jmp_table = ((L1S2 >> 0) & 1) ? jmp2_table : jmp1_table;
 		Copy_int4_x2(jmp_x, jmp_table + 8 * jmp_ind);
 		SubModP(inverse, x, jmp_x);
@@ -95,7 +106,7 @@ __global__ void KernelA(const TKparams Kparams)
 		for (int group = 1; group < PNT_GROUP_CNT; group++)
 		{
 			LOAD_VAL_256(x, L2x, group);
-			jmp_ind = x[0] % JMP_CNT;
+			jmp_ind = FAST_MOD_JMP(x[0]);
 			jmp_table = ((L1S2 >> group) & 1) ? jmp2_table : jmp1_table;
 			Copy_int4_x2(jmp_x, jmp_table + 8 * jmp_ind);
 			SubModP(tmp, x, jmp_x);
@@ -148,7 +159,7 @@ __global__ void KernelA(const TKparams Kparams)
 
 			if (((L1S2 >> group) & 1) == 0) //normal mode, check L1S2 loop
 			{
-				u32 jmp_next = x[0] % JMP_CNT;
+				u32 jmp_next = FAST_MOD_JMP(x[0]);
 				jmp_next |= ((u32)y[0] & 1) ? 0 : INV_FLAG; //inverted
 				L1S2 |= (jmp_ind == jmp_next) ? (1u << group) : 0; //loop L1S2 detected
 			}
@@ -218,7 +229,7 @@ __global__ void KernelA(const TKparams Kparams)
 	__align__(16) u64 Ls[4 * PNT_GROUP_CNT / 2]; //we store only half so need only half mem
 
 	//list of distances of performed jumps for KernelB
-	int4* jlist = (int4*)(Kparams.JumpsList + (u64)BLOCK_X * STEP_CNT * PNT_GROUP_CNT * BLOCK_SIZE / 4);
+	int4* __restrict__ jlist = (int4*)(Kparams.JumpsList + (u64)BLOCK_X * STEP_CNT * PNT_GROUP_CNT * BLOCK_SIZE / 4);
 	jlist += (THREAD_X / 32) * 32 * PNT_GROUP_CNT / 8;
 	//list of last visited points for KernelC
 	u64* x_last0 = Kparams.LastPnts + 2 * THREAD_X + 4 * BLOCK_SIZE * BLOCK_X;
@@ -269,7 +280,7 @@ __global__ void KernelA(const TKparams Kparams)
 	for (int group = 0; group < PNT_GROUP_CNT; group++)
 	{
 		LOAD_VAL_256_m(x, Lx, group);
-		jmp_ind = x[0] % JMP_CNT;
+		jmp_ind = FAST_MOD_JMP(x[0]);
 		jmp_table = ((L1S2 >> group) & 1) ? jmp2_table : jmp1_table;
 		Copy_int4_x2(jmp_x, jmp_table + 8 * jmp_ind);
 		SubModP(tmp, x, jmp_x);
@@ -386,7 +397,7 @@ __global__ void KernelA(const TKparams Kparams)
 
 			if (((L1S2 >> group) & 1) == 0) //normal mode, check L1S2 loop
 			{
-				u32 jmp_next = x[0] % JMP_CNT;
+				u32 jmp_next = FAST_MOD_JMP(x[0]);
 				jmp_next |= ((u32)y[0] & 1) ? 0 : INV_FLAG; //inverted
 				L1S2 |= (jmp_ind == jmp_next) ? (1ull << group) : 0; //loop L1S2 detected
 			}
@@ -420,7 +431,7 @@ __global__ void KernelA(const TKparams Kparams)
 			}
 		
 			//preps to calc next inv
-			jmp_ind = x[0] % JMP_CNT;
+			jmp_ind = FAST_MOD_JMP(x[0]);
 			jmp_table = ((L1S2 >> group) & 1) ? jmp2_table : jmp1_table;
 			Copy_int4_x2(jmp_x, jmp_table + 8 * jmp_ind);
 			SubModP(dx, x, jmp_x);
@@ -515,13 +526,13 @@ __device__ __forceinline__ bool ProcessJumpDistance(u32 step_ind, u32 d_cur, u64
 	int found_ind = iter + MD_LEN - 4;
 	while (1)
 	{
-		if (table[found_ind % MD_LEN] == d[0])
+		if (table[FAST_MOD_MD(found_ind)] == d[0])
 			break;
 		found_ind -= 2;
-		if (table[found_ind % MD_LEN] == d[0])
+		if (table[FAST_MOD_MD(found_ind)] == d[0])
 			break;
 		found_ind -= 2;
-		if (table[found_ind % MD_LEN] == d[0])
+		if (table[FAST_MOD_MD(found_ind)] == d[0])
 			break;
 		found_ind = iter;
 		if (table[found_ind] == d[0])
@@ -530,7 +541,7 @@ __device__ __forceinline__ bool ProcessJumpDistance(u32 step_ind, u32 d_cur, u64
 		break;
 	}
 	table[iter] = d[0];
-	*cur_ind = (iter + 1) % MD_LEN;
+	*cur_ind = FAST_MOD_MD(iter + 1);
 
 	if (found_ind < 0)
 	{		
@@ -713,7 +724,7 @@ __global__ void KernelC(const TKparams Kparams)
 		LOAD_VAL_256(x0, x_last, gr_ind);
 		LOAD_VAL_256(y0, y_last, gr_ind);
 
-		u32 jmp_ind = x0[0] % JMP_CNT;
+		u32 jmp_ind = FAST_MOD_JMP(x0[0]);
 		Copy_int4_x2(jmp_x, jmp3_table + 12 * jmp_ind);
 		Copy_int4_x2(jmp_y, jmp3_table + 12 * jmp_ind + 4);
 		SubModP(inverse, x0, jmp_x);

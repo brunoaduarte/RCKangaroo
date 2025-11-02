@@ -174,63 +174,85 @@ static bool SendRemoteBatch(const RemoteCheckpointBatch &batch)
 	if (!EnsureCurlInitialized())
 		return false;
 
-	CURL *curl = curl_easy_init();
-	if (!curl)
+	// Send in chunks to avoid server/request size limits.
+	// Target max ~16 KiB per POST (payload body).
+	const size_t kMaxPayloadBytes = 16 * 1024;
+	size_t i = 0;
+	while (i < batch.lines.size())
 	{
-		printf("Warning: cannot initialize cURL easy handle for checkpoint sync.\n");
-		return false;
+		// Build a chunk of lines that fits under kMaxPayloadBytes (rough estimate).
+		size_t j = i;
+		size_t approx = 64 + batch.filename.size(); // JSON overhead
+		while (j < batch.lines.size())
+		{
+			// Rough per-line JSON cost: quotes + comma + escaping headroom.
+			approx += 4 + batch.lines[j].size();
+			if (approx > kMaxPayloadBytes && j > i) break;
+			++j;
+		}
+
+		CURL *curl = curl_easy_init();
+		if (!curl)
+		{
+			printf("Warning: cannot initialize cURL easy handle for checkpoint sync.\n");
+			return false;
+		}
+
+		std::string payload;
+		payload.reserve(approx + 32);
+		payload += "{\"filename\":\"";
+		payload += JsonEscape(batch.filename);
+		payload += "\",\"lines\":[";
+		for (size_t k = i; k < j; ++k)
+		{
+			if (k != i) payload += ",";
+			payload += "\"";
+			payload += JsonEscape(batch.lines[k]);
+			payload += "\"";
+		}
+		payload += "]}";
+
+		struct curl_slist *headers = nullptr;
+		headers = curl_slist_append(headers, "Content-Type: application/json");
+
+		curl_easy_setopt(curl, CURLOPT_URL, gPoolAddress.c_str());
+		curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+		curl_easy_setopt(curl, CURLOPT_POSTFIELDS, payload.c_str());
+#ifdef CURLOPT_POSTFIELDSIZE_LARGE
+		curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)payload.size());
+#else
+		curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)payload.size());
+#endif
+		curl_easy_setopt(curl, CURLOPT_TIMEOUT, 60L);
+		curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30L);
+		curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+		curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
+		curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 30L);
+		curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 15L);
+		curl_easy_setopt(curl, CURLOPT_USERAGENT, "RCKangaroo/3.52");
+
+		CURLcode res = curl_easy_perform(curl);
+		long response_code = 0;
+		if (res == CURLE_OK)
+			curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
+
+		curl_slist_free_all(headers);
+		curl_easy_cleanup(curl);
+		if (res != CURLE_OK)
+		{
+			printf("Warning: failed to send checkpoint to pool (%s).\n", curl_easy_strerror(res));
+			return false;
+		}
+		if (response_code < 200 || response_code >= 300)
+		{
+			printf("Warning: pool server returned HTTP %ld while saving checkpoint.\n", response_code);
+			return false;
+		}
+
+		i = j; // next chunk
 	}
-
-	std::string payload;
-	payload.reserve(64 + batch.filename.size() + batch.lines.size() * 80);
-	payload += "{\"filename\":\"";
-	payload += JsonEscape(batch.filename);
-	payload += "\",\"lines\":[";
-	for (size_t i = 0; i < batch.lines.size(); ++i)
-	{
-		if (i) payload += ",";
-		payload += "\"";
-		payload += JsonEscape(batch.lines[i]);
-		payload += "\"";
-	}
-	payload += "]}";
-
-	struct curl_slist *headers = nullptr;
-	headers = curl_slist_append(headers, "Content-Type: application/json");
-
-	curl_easy_setopt(curl, CURLOPT_URL, gPoolAddress.c_str());
-	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-	curl_easy_setopt(curl, CURLOPT_POSTFIELDS, payload.c_str());
-	curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, payload.size());
-	curl_easy_setopt(curl, CURLOPT_TIMEOUT, 60L);
-	curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30L);
-	curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-	curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
-	curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 30L);
-	curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 15L);
-	curl_easy_setopt(curl, CURLOPT_USERAGENT, "RCKangaroo/3.52");
-
-	CURLcode res = curl_easy_perform(curl);
-	long response_code = 0;
-	if (res == CURLE_OK)
-		curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
-
-	curl_slist_free_all(headers);
-	curl_easy_cleanup(curl);
-
-	if (res != CURLE_OK)
-	{
-		printf("Warning: failed to send checkpoint to pool (%s).\n", curl_easy_strerror(res));
-		return false;
-	}
-
-	if (response_code < 200 || response_code >= 300)
-	{
-		printf("Warning: pool server returned HTTP %ld while saving checkpoint.\n", response_code);
-		return false;
-	}
-
 	return true;
+
 }
 
 // Background loop: do not drop items on failure; retry with backoff until success or stop requested.
@@ -239,7 +261,8 @@ static void RemoteSenderLoop()
 	int backoff_ms = 1000;
 	const int backoff_ms_max = 60000;
 
-	while (!gRemoteStop.load(std::memory_order_relaxed))
+	// Drain all pending batches even after stop is requested.
+	while(true)
 	{
 		RemoteCheckpointBatch current;
 
@@ -249,7 +272,8 @@ static void RemoteSenderLoop()
 				return gRemoteStop.load(std::memory_order_relaxed) || !gPendingRemote.empty();
 			});
 
-			if (gRemoteStop.load(std::memory_order_relaxed))
+			// Exit only when stop was requested *and* the queue is empty.
+			if (gRemoteStop.load(std::memory_order_relaxed) && gPendingRemote.empty())
 				break;
 
 			if (!gPendingRemote.empty())
