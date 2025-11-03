@@ -14,7 +14,8 @@ GPU_SRC := RCGpuCore.cu
 CPP_OBJECTS := $(CPU_SRC:.cpp=.o)
 CU_OBJECTS := $(GPU_SRC:.cu=.o)
 
-TARGET := rckangaroo_$(CUDA_VER)_sm$(ARCH)
+CUDA_VER_SAFE := $(subst .,-,$(CUDA_VER))
+TARGET := rckangaroo_cuda-$(CUDA_VER_SAFE)_sm$(ARCH)
 
 all: $(TARGET)
 
