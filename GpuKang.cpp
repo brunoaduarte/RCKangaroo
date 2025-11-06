@@ -10,6 +10,20 @@
 
 #include "GpuKang.h"
 
+#include <cstdio>
+#include <string>
+#ifdef _WIN32
+	#include <io.h>
+	#include <direct.h>
+#else
+	#include <unistd.h>
+	#include <sys/stat.h>
+	#include <sys/types.h>
+#endif
+extern std::string gMachineIdHash4;
+extern std::string gParamsHash4;
+extern int gProgressIntervalSec;
+
 cudaError_t cuSetGpuParams(TKparams Kparams, u64* _jmp2_table);
 void CallGpuKernelGen(TKparams Kparams);
 void CallGpuKernelABC(TKparams Kparams);
@@ -39,6 +53,7 @@ bool RCGpuKang::Prepare(EcPoint _PntToSolve, int _Range, int _DP, EcJMP* _EcJump
 	memset(dbg, 0, sizeof(dbg));
 	memset(SpeedStats, 0, sizeof(SpeedStats));
 	cur_stats_ind = 0;
+	RndPnts = NULL;
 
 	cudaError_t err;
 	err = cudaSetDevice(CudaIndex);
@@ -55,6 +70,9 @@ bool RCGpuKang::Prepare(EcPoint _PntToSolve, int _Range, int _DP, EcJMP* _EcJump
 	Kparams.KernelB_LDS_Size = 64 * JMP_CNT;
 	Kparams.KernelC_LDS_Size = 96 * JMP_CNT;
 	Kparams.IsGenMode = gGenMode;
+
+	snprintf(ProgressFileName, sizeof(ProgressFileName), "PROGRESS/PROGRESS.%s.%s.gpu%d.BIN", gMachineIdHash4.c_str(), gParamsHash4.c_str(), CudaIndex);
+	lastSaveTick = GetTickCount64();
 
 //allocate gpu mem
 	u64 size;
@@ -321,65 +339,43 @@ bool RCGpuKang::Start()
 	PntA = ec.AddPoints(PntToSolve, NegPntHalfRange);
 	PntB = PntA;
 	PntB.y.NegModP();
+	
+	bool loaded = false;
+	if (gProgressIntervalSec > 0)
+		loaded = LoadProgress();
+	
+	if (!loaded)
+	{
+		RndPnts = (TPointPriv*)malloc(KangCnt * 96);
+		GenerateRndDistances();
 
-	RndPnts = (TPointPriv*)malloc(KangCnt * 96);
-	GenerateRndDistances();
-/* 
-	//we can calc start points on CPU
-	for (int i = 0; i < KangCnt; i++)
-	{
-		EcInt d;
-		memcpy(d.data, RndPnts[i].priv, 24);
-		d.data[3] = 0;
-		d.data[4] = 0;
-		EcPoint p = ec.MultiplyG(d);
-		memcpy(RndPnts[i].x, p.x.data, 32);
-		memcpy(RndPnts[i].y, p.y.data, 32);
-	}
-	for (int i = KangCnt / 3; i < 2 * KangCnt / 3; i++)
-	{
-		EcPoint p;
-		p.LoadFromBuffer64((u8*)RndPnts[i].x);
-		p = ec.AddPoints(p, PntA);
-		p.SaveToBuffer64((u8*)RndPnts[i].x);
-	}
-	for (int i = 2 * KangCnt / 3; i < KangCnt; i++)
-	{
-		EcPoint p;
-		p.LoadFromBuffer64((u8*)RndPnts[i].x);
-		p = ec.AddPoints(p, PntB);
-		p.SaveToBuffer64((u8*)RndPnts[i].x);
-	}
-	//copy to gpu
-	err = cudaMemcpy(Kparams.Kangs, RndPnts, KangCnt * 96, cudaMemcpyHostToDevice);
-	if (err != cudaSuccess)
-	{
-		printf("GPU %d, cudaMemcpy failed: %s\n", CudaIndex, cudaGetErrorString(err));
-		return false;
-	}
-/**/
-	//but it's faster to calc then on GPU
-	u8 buf_PntA[64], buf_PntB[64];
-	PntA.SaveToBuffer64(buf_PntA);
-	PntB.SaveToBuffer64(buf_PntB);
-	for (int i = 0; i < KangCnt; i++)
-	{
-		if (i < KangCnt / 3)
-			memset(RndPnts[i].x, 0, 64);
-		else
-			if (i < 2 * KangCnt / 3)
+		u8 buf_PntA[64], buf_PntB[64];
+		PntA.SaveToBuffer64(buf_PntA);
+		PntB.SaveToBuffer64(buf_PntB);
+		for (int i = 0; i < KangCnt; i++)
+		{
+			if (i < KangCnt / 3)
+				memset(RndPnts[i].x, 0, 64);
+			else if (i < 2 * KangCnt / 3)
 				memcpy(RndPnts[i].x, buf_PntA, 64);
 			else
 				memcpy(RndPnts[i].x, buf_PntB, 64);
+		}
+		//copy to gpu
+		err = cudaMemcpy(Kparams.Kangs, RndPnts, KangCnt * 96, cudaMemcpyHostToDevice);
+		if (err != cudaSuccess)
+		{
+			printf("GPU %d, cudaMemcpy failed: %s\n", CudaIndex, cudaGetErrorString(err));
+			return false;
+		}
+		CallGpuKernelGen(Kparams);
+		if (gProgressIntervalSec > 0)
+			printf("GPU %d: no progress file, starting new session\n", CudaIndex);
 	}
-	//copy to gpu
-	err = cudaMemcpy(Kparams.Kangs, RndPnts, KangCnt * 96, cudaMemcpyHostToDevice);
-	if (err != cudaSuccess)
+	else
 	{
-		printf("GPU %d, cudaMemcpy failed: %s\n", CudaIndex, cudaGetErrorString(err));
-		return false;
+		printf("GPU %d: loaded progress from %s\n", CudaIndex, ProgressFileName);
 	}
-	CallGpuKernelGen(Kparams);
 
 	err = cudaMemset(Kparams.L1S2, 0, mpCnt * Kparams.BlockSize * 8);
 	if (err != cudaSuccess)
@@ -427,6 +423,83 @@ int RCGpuKang::Dbg_CheckKangs()
 	return res;
 }
 #endif
+
+bool RCGpuKang::SaveProgress()
+{
+	size_t bytes = (size_t)KangCnt * 96;
+	u8 *host = (u8 *)malloc(bytes);
+	cudaError_t err = cudaMemcpy(host, Kparams.Kangs, bytes, cudaMemcpyDeviceToHost);
+	if (err != cudaSuccess)
+	{
+		free(host);
+		return false;
+	}
+#ifdef _WIN32
+	_mkdir("PROGRESS");
+#else
+	mkdir("PROGRESS", 0777);
+#endif
+	FILE *f = fopen(ProgressFileName, "wb");
+	if (!f)
+	{
+		free(host);
+		return false;
+	}
+	ProgressHeader hdr;
+	memset(&hdr, 0, sizeof(hdr));
+	memcpy(hdr.magic, "RCKANGPROGv1", 12);
+	hdr.version = 1;
+	hdr.range = (u32)Range;
+	hdr.dp = (u32)DP;
+	hdr.kangCnt = (u32)KangCnt;
+	hdr.blockSize = Kparams.BlockSize;
+	hdr.groupCnt = Kparams.GroupCnt;
+	hdr.cudaIndex = (u32)CudaIndex;
+	size_t w1 = fwrite(&hdr, 1, sizeof(hdr), f);
+	size_t w2 = fwrite(host, 1, bytes, f);
+	int ok = fflush(f);
+#ifdef _WIN32
+	if (ok == 0)
+		ok = _commit(_fileno(f));
+#else
+	if (ok == 0)
+		ok = fsync(fileno(f));
+#endif
+	fclose(f);
+	free(host);
+	return w1 == sizeof(hdr) && w2 == bytes && ok == 0;
+}
+
+bool RCGpuKang::LoadProgress()
+{
+	FILE *f = fopen(ProgressFileName, "rb");
+	if (!f)
+		return false;
+	ProgressHeader hdr;
+	size_t r = fread(&hdr, 1, sizeof(hdr), f);
+	if (r != sizeof(hdr))
+	{
+		fclose(f);
+		return false;
+	}
+	if (memcmp(hdr.magic, "RCKANGPROGv1", 12) != 0 || hdr.version != 1 || hdr.range != (u32)Range || hdr.dp != (u32)DP || hdr.kangCnt != (u32)KangCnt)
+	{
+		fclose(f);
+		return false;
+	}
+	size_t bytes = (size_t)hdr.kangCnt * 96;
+	u8 *host = (u8 *)malloc(bytes);
+	size_t rr = fread(host, 1, bytes, f);
+	fclose(f);
+	if (rr != bytes)
+	{
+		free(host);
+		return false;
+	}
+	cudaError_t err = cudaMemcpy(Kparams.Kangs, host, bytes, cudaMemcpyHostToDevice);
+	free(host);
+	return err == cudaSuccess;
+}
 
 extern u32 gTotalErrors;
 
@@ -494,6 +567,15 @@ void RCGpuKang::Execute()
 
 		SpeedStats[cur_stats_ind] = cur_speed;
 		cur_stats_ind = (cur_stats_ind + 1) % STATS_WND_SIZE;
+		if (gProgressIntervalSec > 0)
+		{
+			u64 now = GetTickCount64();
+			if (now - lastSaveTick >= (u64)gProgressIntervalSec * 1000ull)
+			{
+				SaveProgress();
+				lastSaveTick = now;
+			}
+		}
 
 #ifdef DEBUG_MODE
 		if ((iter % 300) == 0)
@@ -516,8 +598,40 @@ void RCGpuKang::Execute()
 
 int RCGpuKang::GetStatsSpeed()
 {
-	int res = SpeedStats[0];
-	for (int i = 1; i < STATS_WND_SIZE; i++)
-		res += SpeedStats[i];
-	return res / STATS_WND_SIZE;
+	static int last_idx[MAX_GPU_CNT];
+	static u64 last_ms[MAX_GPU_CNT];
+	static long long last_sum[MAX_GPU_CNT];
+	static int last_xor[MAX_GPU_CNT];
+	static unsigned char init = 0;
+	if (!init)
+	{
+		for (int i = 0; i < MAX_GPU_CNT; ++i)
+		{
+			last_idx[i] = -1;
+			last_ms[i] = 0;
+			last_sum[i] = 0;
+			last_xor[i] = 0;
+		}
+		init = 1;
+	}
+	long long sum = 0;
+	int xr = 0;
+	for (int i = 0; i < STATS_WND_SIZE; ++i)
+	{
+		int v = SpeedStats[i];
+		sum += v;
+		xr ^= v;
+	}
+	int idx = cur_stats_ind;
+	u64 now = GetTickCount64();
+	if (idx == last_idx[CudaIndex] && last_ms[CudaIndex] != 0 && now - last_ms[CudaIndex] > 3000ull && sum == last_sum[CudaIndex] && xr == last_xor[CudaIndex])
+	{
+		last_ms[CudaIndex] = now;
+		return 0;
+	}
+	last_idx[CudaIndex] = idx;
+	last_ms[CudaIndex] = now;
+	last_sum[CudaIndex] = sum;
+	last_xor[CudaIndex] = xr;
+	return (int)(sum / STATS_WND_SIZE);
 }

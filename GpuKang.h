@@ -24,6 +24,18 @@ struct TPointPriv
 	u64 priv[4];
 };
 
+struct ProgressHeader
+{
+	char magic[16];
+	u32 version;
+	u32 range;
+	u32 dp;
+	u32 kangCnt;
+	u32 blockSize;
+	u32 groupCnt;
+	u32 cudaIndex;
+};
+
 class RCGpuKang
 {
 private:
@@ -49,6 +61,9 @@ private:
 
 	int cur_stats_ind;
 	int SpeedStats[STATS_WND_SIZE];
+	
+	char ProgressFileName[1024];
+	u64 lastSaveTick;
 
 	void GenerateRndDistances();
 	bool Start();
@@ -70,6 +85,9 @@ public:
 	void Execute();
 
 	u32 dbg[256];
+	
+	bool SaveProgress();
+	bool LoadProgress();
 
 	int GetStatsSpeed();
 };

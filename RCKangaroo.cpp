@@ -61,10 +61,11 @@ char gTamesFileName[1024];
 double gMax;
 bool gGenMode; //tames generation mode
 bool gIsOpsLimit;
+int gProgressIntervalSec;
 
 bool gSaveCheckpoints = false;
 std::string gClientID;
-std::string gSoftVersion = "3.52-autosend";
+std::string gSoftVersion = "3.6-autosend";
 int gLastCheckpointDay = -1;
 std::string gRawParams;
 #include <ctime>
@@ -546,7 +547,7 @@ void AddCheckpointsToList(u8 *pPntList2, int cnt)
 			sprintf(buf + 25 + j * 2, "00");
 		for (int j = 0; j < 24; ++j)
 			sprintf(buf + 41 + j * 2, "%02x", d[23 - j]);
-		int type = p[40];
+		int type = gGenMode ? TAME : p[40];
 		snprintf(buf + 25 + 64, 16, " TYPE:%d", type);
 		gPoolCheckpoints.emplace_back(buf);
 	}
@@ -815,9 +816,10 @@ void ShowStats(u64 tm_start, double exp_ops, double dp_val)
 	u64 exp_sec = 0xFFFFFFFFFFFFFFFFull;
 	if (speed)
 		exp_sec = (u64)((exp_ops / 1000000) / speed); //in sec
-	u64 exp_days = exp_sec / (3600 * 24);
-	u64 exp_hours = (exp_sec % (3600 * 24)) / 3600;
+	u64 exp_days = exp_sec / (86400);
+	u64 exp_hours = (exp_sec % (86400)) / 3600;
 	u64 exp_min = (exp_sec % 3600) / 60;
+	u64 exp_s = exp_sec % 60;
 
 	u64 exp_years = exp_days / 365;
 	u64 rem_days = exp_days % 365;
@@ -835,9 +837,9 @@ void ShowStats(u64 tm_start, double exp_ops, double dp_val)
 	printf("\n%s\n", mode_str);
 	printf("%-8s%d MKeys/s, Err: %d\n", "Speed:", speed, gTotalErrors);
 	printf("%-8s%llu / %llu\n", "DPs:", db.GetBlockCnt(), est_dps_cnt);
-	printf("%-8s%llud:%02lluh:%02llum:%02llus / %lluy:%llud:%02lluh:%02llum\n", "Time:",
+	printf("%-8s%llud:%02lluh:%02llum:%02llus / %lluy:%llud:%02lluh:%02llum:%02llus\n", "Time:",
 		   days, hours, min, sec,
-		   exp_years, rem_days, exp_hours, exp_min);
+		   exp_years, rem_days, exp_hours, exp_min, exp_s);
 }
 
 bool SolvePoint(EcPoint PntToSolve, int Range, int DP, EcInt* pk_res)
@@ -1067,8 +1069,7 @@ bool ParseCommandLine(int argc, char* argv[])
 				gGPUs_Mask[gpus[i] - '0'] = 1;
 			}
 		}
-		else
-		if (strcmp(argument, "-dp") == 0)
+		else if (strcmp(argument, "-dp") == 0)
 		{
 			if (ci >= argc) { printf("error: missed value after -dp option\r\n"); return false; }
 			int val = atoi(argv[ci]);
@@ -1080,8 +1081,7 @@ bool ParseCommandLine(int argc, char* argv[])
 			}
 			gDP = val;
 		}
-		else
-		if (strcmp(argument, "-range") == 0)
+		else if (strcmp(argument, "-range") == 0)
 		{
 			if (ci >= argc) { printf("error: missed value after -range option\r\n"); return false; }
 			int val = atoi(argv[ci]);
@@ -1093,8 +1093,7 @@ bool ParseCommandLine(int argc, char* argv[])
 			}
 			gRange = val;
 		}
-		else
-		if (strcmp(argument, "-start") == 0)
+		else if (strcmp(argument, "-start") == 0)
 		{	
 			if (ci >= argc) { printf("error: missed value after -start option\r\n"); return false; }
 			if (!gStart.SetHexStr(argv[ci]))
@@ -1105,8 +1104,7 @@ bool ParseCommandLine(int argc, char* argv[])
 			ci++;
 			gStartSet = true;
 		}
-		else
-		if (strcmp(argument, "-pubkey") == 0)
+		else if (strcmp(argument, "-pubkey") == 0)
 		{
 			if (ci >= argc) { printf("error: missed value after -pubkey option\r\n"); return false; }
 			if (!gPubKey.SetHexStr(argv[ci]))
@@ -1116,15 +1114,13 @@ bool ParseCommandLine(int argc, char* argv[])
 			}
 			ci++;
 		}
-		else
-		if (strcmp(argument, "-tames") == 0)
+		else if (strcmp(argument, "-tames") == 0)
 		{
 			if (ci >= argc) { printf("error: missed value after -tames option\r\n"); return false; }
 			strcpy(gTamesFileName, argv[ci]);
 			ci++;
 		}
-		else
-		if (strcmp(argument, "-max") == 0)
+		else if (strcmp(argument, "-max") == 0)
 		{
 			if (ci >= argc) { printf("error: missed value after -max option\r\n"); return false; }
 			double val = atof(argv[ci]);
@@ -1184,6 +1180,18 @@ bool ParseCommandLine(int argc, char* argv[])
 
 			gClientID = id;
 			gSaveCheckpoints = true;
+		}
+		
+		else if (strcmp(argument, "-progress") == 0)
+		{
+			int val = atoi(argv[ci]);
+			ci++;
+			if (val < 10)
+			{
+				printf("error: invalid value for -progress option\r\n");
+				return false;
+			}
+			gProgressIntervalSec = val;
 		}
 
 		else
@@ -1352,6 +1360,7 @@ int main(int argc, char *argv[])
 	gMax = 0.0;
 	gGenMode = false;
 	gIsOpsLimit = false;
+	gProgressIntervalSec = 0;
 	memset(gGPUs_Mask, 1, sizeof(gGPUs_Mask));
 	if (!ParseCommandLine(argc, argv))
 		return 0;
