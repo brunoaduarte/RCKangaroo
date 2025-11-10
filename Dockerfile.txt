@@ -1,0 +1,24 @@
+10/11/2025
+
+# If first time need to execute all the steps, if docker container already created and volume exists, skip to step 2)
+
+1)
+
+	# Build custom "nvidia/cuda:12.4.0-devel-ubuntu22.04" docker image that will have CUDA 12.0, 12.2 and 12.4
+	# Used to build CUDA 12.X binaries for RCKangaroo
+
+	docker build -t mycuda:12.X-ubuntu22.04 .
+	docker run --rm -it --gpus all -v /home/ubuntu/docker-volumes/ubuntu2204-cuda:/root mycuda:12.X-ubuntu22.04 bash
+
+	# then inside the container run
+	cd ~; git clone https://github.com/brunoaduarte/RCKangaroo; cd RCKangaroo; git switch pool
+
+2)
+
+	git pull
+	for v in 12.0 12.2 12.4; do make clean; CUDA_VER=$v ARCH=86,89 make -j"$(nproc)" gpu=0 all; done
+
+	# while still running the container, in another terminal copy the binaries to the host
+	# dc is the container id
+
+	dc=610cd1f5c802; p=/root/RCKangaroo/rckangaroo_cuda; for v in 12-0 12-2 12-4; do docker cp $dc:${p}-${v}_sm86_sm89 ~/wallets/rckangaroo/brunoaduarte-RCKangaroo/bin/ ; done
