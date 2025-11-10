@@ -3,29 +3,41 @@
 // License: GPLv3, see "LICENSE.TXT" file
 // https://github.com/RetiredC
 
-
 #include <iostream>
 #include "cuda_runtime.h"
 #include "cuda.h"
 
 #include "GpuKang.h"
+#include <cstdio>
+#include <string>
+#ifdef _WIN32
+#include <io.h>
+#include <direct.h>
+#else
+#include <unistd.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#endif
+extern std::string gMachineIdHash4;
+extern std::string gParamsHash4;
+extern int gProgressIntervalSec;
 
-cudaError_t cuSetGpuParams(TKparams Kparams, u64* _jmp2_table);
+cudaError_t cuSetGpuParams(TKparams Kparams, u64 *_jmp2_table);
 void CallGpuKernelGen(TKparams Kparams);
 void CallGpuKernelABC(TKparams Kparams);
-void AddPointsToList(u32* data, int cnt, u64 ops_cnt);
-extern bool gGenMode; //tames generation mode
+void AddPointsToList(u32 *data, int cnt, u64 ops_cnt);
+extern bool gGenMode; // tames generation mode
 
 int RCGpuKang::CalcKangCnt()
 {
 	Kparams.BlockCnt = mpCnt;
 	Kparams.BlockSize = IsOldGpu ? 512 : 256;
 	Kparams.GroupCnt = IsOldGpu ? 64 : 24;
-	return Kparams.BlockSize* Kparams.GroupCnt* Kparams.BlockCnt;
+	return Kparams.BlockSize * Kparams.GroupCnt * Kparams.BlockCnt;
 }
 
-//executes in main thread
-bool RCGpuKang::Prepare(EcPoint _PntToSolve, int _Range, int _DP, EcJMP* _EcJumps1, EcJMP* _EcJumps2, EcJMP* _EcJumps3)
+// executes in main thread
+bool RCGpuKang::Prepare(EcPoint _PntToSolve, int _Range, int _DP, EcJMP *_EcJumps1, EcJMP *_EcJumps2, EcJMP *_EcJumps3)
 {
 	PntToSolve = _PntToSolve;
 	Range = _Range;
@@ -38,6 +50,8 @@ bool RCGpuKang::Prepare(EcPoint _PntToSolve, int _Range, int _DP, EcJMP* _EcJump
 	u64 total_mem = 0;
 	memset(dbg, 0, sizeof(dbg));
 	memset(SpeedStats, 0, sizeof(SpeedStats));
+	RndPnts = NULL;
+
 	cur_stats_ind = 0;
 
 	cudaError_t err;
@@ -56,14 +70,18 @@ bool RCGpuKang::Prepare(EcPoint _PntToSolve, int _Range, int _DP, EcJMP* _EcJump
 	Kparams.KernelC_LDS_Size = 96 * JMP_CNT;
 	Kparams.IsGenMode = gGenMode;
 
-//allocate gpu mem
+	snprintf(ProgressFileName, sizeof(ProgressFileName), "PROGRESS/PROGRESS.%s.%s.gpu%d.BIN", gMachineIdHash4.c_str(), gParamsHash4.c_str(), CudaIndex);
+
+	lastSaveTick = GetTickCount64();
+
+	// allocate gpu mem
 	u64 size;
 	if (!IsOldGpu)
 	{
-		//L2	
+		// L2
 		int L2size = Kparams.KangCnt * (3 * 32);
 		total_mem += L2size;
-		err = cudaMalloc((void**)&Kparams.L2, L2size);
+		err = cudaMalloc((void **)&Kparams.L2, L2size);
 		if (err != cudaSuccess)
 		{
 			printf("GPU %d, Allocate L2 memory failed: %s\n", CudaIndex, cudaGetErrorString(err));
@@ -73,13 +91,13 @@ bool RCGpuKang::Prepare(EcPoint _PntToSolve, int _Range, int _DP, EcJMP* _EcJump
 		if (size > persistingL2CacheMaxSize)
 			size = persistingL2CacheMaxSize;
 		err = cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, size); // set max allowed size for L2
-		//persisting for L2
-		cudaStreamAttrValue stream_attribute;                                                   
+		// persisting for L2
+		cudaStreamAttrValue stream_attribute;
 		stream_attribute.accessPolicyWindow.base_ptr = Kparams.L2;
-		stream_attribute.accessPolicyWindow.num_bytes = size;										
-		stream_attribute.accessPolicyWindow.hitRatio = 1.0;                                     
-		stream_attribute.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;             
-		stream_attribute.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;  	
+		stream_attribute.accessPolicyWindow.num_bytes = size;
+		stream_attribute.accessPolicyWindow.hitRatio = 1.0;
+		stream_attribute.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
+		stream_attribute.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
 		err = cudaStreamSetAttribute(NULL, cudaStreamAttributeAccessPolicyWindow, &stream_attribute);
 		if (err != cudaSuccess)
 		{
@@ -89,7 +107,7 @@ bool RCGpuKang::Prepare(EcPoint _PntToSolve, int _Range, int _DP, EcJMP* _EcJump
 	}
 	size = MAX_DP_CNT * GPU_DP_SIZE + 16;
 	total_mem += size;
-	err = cudaMalloc((void**)&Kparams.DPs_out, size);
+	err = cudaMalloc((void **)&Kparams.DPs_out, size);
 	if (err != cudaSuccess)
 	{
 		printf("GPU %d Allocate GpuOut memory failed: %s\n", CudaIndex, cudaGetErrorString(err));
@@ -98,7 +116,7 @@ bool RCGpuKang::Prepare(EcPoint _PntToSolve, int _Range, int _DP, EcJMP* _EcJump
 
 	size = KangCnt * 96;
 	total_mem += size;
-	err = cudaMalloc((void**)&Kparams.Kangs, size);
+	err = cudaMalloc((void **)&Kparams.Kangs, size);
 	if (err != cudaSuccess)
 	{
 		printf("GPU %d Allocate pKangs memory failed: %s\n", CudaIndex, cudaGetErrorString(err));
@@ -106,7 +124,7 @@ bool RCGpuKang::Prepare(EcPoint _PntToSolve, int _Range, int _DP, EcJMP* _EcJump
 	}
 
 	total_mem += JMP_CNT * 96;
-	err = cudaMalloc((void**)&Kparams.Jumps1, JMP_CNT * 96);
+	err = cudaMalloc((void **)&Kparams.Jumps1, JMP_CNT * 96);
 	if (err != cudaSuccess)
 	{
 		printf("GPU %d Allocate Jumps1 memory failed: %s\n", CudaIndex, cudaGetErrorString(err));
@@ -114,7 +132,7 @@ bool RCGpuKang::Prepare(EcPoint _PntToSolve, int _Range, int _DP, EcJMP* _EcJump
 	}
 
 	total_mem += JMP_CNT * 96;
-	err = cudaMalloc((void**)&Kparams.Jumps2, JMP_CNT * 96);
+	err = cudaMalloc((void **)&Kparams.Jumps2, JMP_CNT * 96);
 	if (err != cudaSuccess)
 	{
 		printf("GPU %d Allocate Jumps1 memory failed: %s\n", CudaIndex, cudaGetErrorString(err));
@@ -122,7 +140,7 @@ bool RCGpuKang::Prepare(EcPoint _PntToSolve, int _Range, int _DP, EcJMP* _EcJump
 	}
 
 	total_mem += JMP_CNT * 96;
-	err = cudaMalloc((void**)&Kparams.Jumps3, JMP_CNT * 96);
+	err = cudaMalloc((void **)&Kparams.Jumps3, JMP_CNT * 96);
 	if (err != cudaSuccess)
 	{
 		printf("GPU %d Allocate Jumps3 memory failed: %s\n", CudaIndex, cudaGetErrorString(err));
@@ -131,16 +149,16 @@ bool RCGpuKang::Prepare(EcPoint _PntToSolve, int _Range, int _DP, EcJMP* _EcJump
 
 	size = 2 * (u64)KangCnt * STEP_CNT;
 	total_mem += size;
-	err = cudaMalloc((void**)&Kparams.JumpsList, size);
+	err = cudaMalloc((void **)&Kparams.JumpsList, size);
 	if (err != cudaSuccess)
 	{
 		printf("GPU %d Allocate JumpsList memory failed: %s\n", CudaIndex, cudaGetErrorString(err));
 		return false;
 	}
 
-	size = (u64)KangCnt * (16 * DPTABLE_MAX_CNT + sizeof(u32)); //we store 16bytes of X
+	size = (u64)KangCnt * (16 * DPTABLE_MAX_CNT + sizeof(u32)); // we store 16bytes of X
 	total_mem += size;
-	err = cudaMalloc((void**)&Kparams.DPTable, size);
+	err = cudaMalloc((void **)&Kparams.DPTable, size);
 	if (err != cudaSuccess)
 	{
 		printf("GPU %d Allocate DPTable memory failed: %s\n", CudaIndex, cudaGetErrorString(err));
@@ -149,7 +167,7 @@ bool RCGpuKang::Prepare(EcPoint _PntToSolve, int _Range, int _DP, EcJMP* _EcJump
 
 	size = mpCnt * Kparams.BlockSize * sizeof(u64);
 	total_mem += size;
-	err = cudaMalloc((void**)&Kparams.L1S2, size);
+	err = cudaMalloc((void **)&Kparams.L1S2, size);
 	if (err != cudaSuccess)
 	{
 		printf("GPU %d Allocate L1S2 memory failed: %s\n", CudaIndex, cudaGetErrorString(err));
@@ -158,7 +176,7 @@ bool RCGpuKang::Prepare(EcPoint _PntToSolve, int _Range, int _DP, EcJMP* _EcJump
 
 	size = (u64)KangCnt * MD_LEN * (2 * 32);
 	total_mem += size;
-	err = cudaMalloc((void**)&Kparams.LastPnts, size);
+	err = cudaMalloc((void **)&Kparams.LastPnts, size);
 	if (err != cudaSuccess)
 	{
 		printf("GPU %d Allocate LastPnts memory failed: %s\n", CudaIndex, cudaGetErrorString(err));
@@ -167,7 +185,7 @@ bool RCGpuKang::Prepare(EcPoint _PntToSolve, int _Range, int _DP, EcJMP* _EcJump
 
 	size = (u64)KangCnt * MD_LEN * sizeof(u64);
 	total_mem += size;
-	err = cudaMalloc((void**)&Kparams.LoopTable, size);
+	err = cudaMalloc((void **)&Kparams.LoopTable, size);
 	if (err != cudaSuccess)
 	{
 		printf("GPU %d Allocate LastPnts memory failed: %s\n", CudaIndex, cudaGetErrorString(err));
@@ -175,7 +193,7 @@ bool RCGpuKang::Prepare(EcPoint _PntToSolve, int _Range, int _DP, EcJMP* _EcJump
 	}
 
 	total_mem += 1024;
-	err = cudaMalloc((void**)&Kparams.dbg_buf, 1024);
+	err = cudaMalloc((void **)&Kparams.dbg_buf, 1024);
 	if (err != cudaSuccess)
 	{
 		printf("GPU %d Allocate dbg_buf memory failed: %s\n", CudaIndex, cudaGetErrorString(err));
@@ -184,17 +202,17 @@ bool RCGpuKang::Prepare(EcPoint _PntToSolve, int _Range, int _DP, EcJMP* _EcJump
 
 	size = sizeof(u32) * KangCnt + 8;
 	total_mem += size;
-	err = cudaMalloc((void**)&Kparams.LoopedKangs, size);
+	err = cudaMalloc((void **)&Kparams.LoopedKangs, size);
 	if (err != cudaSuccess)
 	{
 		printf("GPU %d Allocate LoopedKangs memory failed: %s\n", CudaIndex, cudaGetErrorString(err));
 		return false;
 	}
 
-	DPs_out = (u32*)malloc(MAX_DP_CNT * GPU_DP_SIZE);
+	DPs_out = (u32 *)malloc(MAX_DP_CNT * GPU_DP_SIZE);
 
-//jmp1
-	u64* buf = (u64*)malloc(JMP_CNT * 96);
+	// jmp1
+	u64 *buf = (u64 *)malloc(JMP_CNT * 96);
 	for (int i = 0; i < JMP_CNT; i++)
 	{
 		memcpy(buf + i * 12, EcJumps1[i].p.x.data, 32);
@@ -208,9 +226,9 @@ bool RCGpuKang::Prepare(EcPoint _PntToSolve, int _Range, int _DP, EcJMP* _EcJump
 		return false;
 	}
 	free(buf);
-//jmp2
-	buf = (u64*)malloc(JMP_CNT * 96);
-	u64* jmp2_table = (u64*)malloc(JMP_CNT * 64);
+	// jmp2
+	buf = (u64 *)malloc(JMP_CNT * 96);
+	u64 *jmp2_table = (u64 *)malloc(JMP_CNT * 64);
 	for (int i = 0; i < JMP_CNT; i++)
 	{
 		memcpy(buf + i * 12, EcJumps2[i].p.x.data, 32);
@@ -235,8 +253,8 @@ bool RCGpuKang::Prepare(EcPoint _PntToSolve, int _Range, int _DP, EcJMP* _EcJump
 		return false;
 	}
 	free(jmp2_table);
-//jmp3
-	buf = (u64*)malloc(JMP_CNT * 96);
+	// jmp3
+	buf = (u64 *)malloc(JMP_CNT * 96);
 	for (int i = 0; i < JMP_CNT; i++)
 	{
 		memcpy(buf + i * 12, EcJumps3[i].p.x.data, 32);
@@ -286,11 +304,11 @@ void RCGpuKang::GenerateRndDistances()
 	{
 		EcInt d;
 		if (i < KangCnt / 3)
-			d.RndBits(Range - 4); //TAME kangs
+			d.RndBits(Range - 4); // TAME kangs
 		else
 		{
 			d.RndBits(Range - 1);
-			d.data[0] &= 0xFFFFFFFFFFFFFFFE; //must be even
+			d.data[0] &= 0xFFFFFFFFFFFFFFFE; // must be even
 		}
 		memcpy(RndPnts[i].priv, d.data, 24);
 	}
@@ -316,64 +334,67 @@ bool RCGpuKang::Start()
 	PntB = PntA;
 	PntB.y.NegModP();
 
-	RndPnts = (TPointPriv*)malloc(KangCnt * 96);
-	GenerateRndDistances();
-/* 
-	//we can calc start points on CPU
-	for (int i = 0; i < KangCnt; i++)
+	// RndPnts = (TPointPriv *)malloc(KangCnt * 96);
+	// GenerateRndDistances();
+
+	// if (!(gProgressIntervalSec > 0 && LoadProgress()))
+	// {
+	// 	RndPnts = (TPointPriv *)malloc(KangCnt * 96);
+	// 	GenerateRndDistances();
+	// 	u8 buf_PntA[64], buf_PntB[64];
+	// 	PntA.SaveToBuffer64(buf_PntA);
+	// 	PntB.SaveToBuffer64(buf_PntB);
+	// 	for (int i = 0; i < KangCnt; i++)
+	// 	{
+	// 		if (i < KangCnt / 3)
+	// 			memset(RndPnts[i].x, 0, 64);
+	// 		else if (i < 2 * KangCnt / 3)
+	// 			memcpy(RndPnts[i].x, buf_PntA, 64);
+	// 		else
+	// 			memcpy(RndPnts[i].x, buf_PntB, 64);
+	// 	}
+	// 	err = cudaMemcpy(Kparams.Kangs, RndPnts, KangCnt * 96, cudaMemcpyHostToDevice);
+	// 	if (err != cudaSuccess)
+	// 	{
+	// 		printf("GPU %d, cudaMemcpy failed: %s\n", CudaIndex, cudaGetErrorString(err));
+	// 		return false;
+	// 	}
+	// 	CallGpuKernelGen(Kparams);
+	// }
+
+	bool loaded = false;
+	if (gProgressIntervalSec > 0)
+		loaded = LoadProgress();
+	if (!loaded)
 	{
-		EcInt d;
-		memcpy(d.data, RndPnts[i].priv, 24);
-		d.data[3] = 0;
-		d.data[4] = 0;
-		EcPoint p = ec.MultiplyG(d);
-		memcpy(RndPnts[i].x, p.x.data, 32);
-		memcpy(RndPnts[i].y, p.y.data, 32);
-	}
-	for (int i = KangCnt / 3; i < 2 * KangCnt / 3; i++)
-	{
-		EcPoint p;
-		p.LoadFromBuffer64((u8*)RndPnts[i].x);
-		p = ec.AddPoints(p, PntA);
-		p.SaveToBuffer64((u8*)RndPnts[i].x);
-	}
-	for (int i = 2 * KangCnt / 3; i < KangCnt; i++)
-	{
-		EcPoint p;
-		p.LoadFromBuffer64((u8*)RndPnts[i].x);
-		p = ec.AddPoints(p, PntB);
-		p.SaveToBuffer64((u8*)RndPnts[i].x);
-	}
-	//copy to gpu
-	err = cudaMemcpy(Kparams.Kangs, RndPnts, KangCnt * 96, cudaMemcpyHostToDevice);
-	if (err != cudaSuccess)
-	{
-		printf("GPU %d, cudaMemcpy failed: %s\n", CudaIndex, cudaGetErrorString(err));
-		return false;
-	}
-/**/
-	//but it's faster to calc then on GPU
-	u8 buf_PntA[64], buf_PntB[64];
-	PntA.SaveToBuffer64(buf_PntA);
-	PntB.SaveToBuffer64(buf_PntB);
-	for (int i = 0; i < KangCnt; i++)
-	{
-		if (i < KangCnt / 3)
-			memset(RndPnts[i].x, 0, 64);
-		else
-			if (i < 2 * KangCnt / 3)
+		RndPnts = (TPointPriv *)malloc(KangCnt * 96);
+		GenerateRndDistances();
+		u8 buf_PntA[64], buf_PntB[64];
+		PntA.SaveToBuffer64(buf_PntA);
+		PntB.SaveToBuffer64(buf_PntB);
+		for (int i = 0; i < KangCnt; i++)
+		{
+			if (i < KangCnt / 3)
+				memset(RndPnts[i].x, 0, 64);
+			else if (i < 2 * KangCnt / 3)
 				memcpy(RndPnts[i].x, buf_PntA, 64);
 			else
 				memcpy(RndPnts[i].x, buf_PntB, 64);
+		}
+		err = cudaMemcpy(Kparams.Kangs, RndPnts, KangCnt * 96, cudaMemcpyHostToDevice);
+		if (err != cudaSuccess)
+		{
+			printf("GPU %d, cudaMemcpy failed: %s\n", CudaIndex, cudaGetErrorString(err));
+			return false;
+		}
+		CallGpuKernelGen(Kparams);
+		if (gProgressIntervalSec > 0)
+			printf("GPU %d: no progress file, starting new session\n", CudaIndex);
 	}
-	//copy to gpu
-	err = cudaMemcpy(Kparams.Kangs, RndPnts, KangCnt * 96, cudaMemcpyHostToDevice);
-	if (err != cudaSuccess)
+	else
 	{
-		printf("GPU %d, cudaMemcpy failed: %s\n", CudaIndex, cudaGetErrorString(err));
-		return false;
+		printf("GPU %d: loaded progress from %s\n", CudaIndex, ProgressFileName);
 	}
-	CallGpuKernelGen(Kparams);
 
 	err = cudaMemset(Kparams.L1S2, 0, mpCnt * Kparams.BlockSize * 8);
 	if (err != cudaSuccess)
@@ -387,13 +408,13 @@ bool RCGpuKang::Start()
 int RCGpuKang::Dbg_CheckKangs()
 {
 	int kang_size = mpCnt * Kparams.BlockSize * Kparams.GroupCnt * 96;
-	u64* kangs = (u64*)malloc(kang_size);
+	u64 *kangs = (u64 *)malloc(kang_size);
 	cudaError_t err = cudaMemcpy(kangs, Kparams.Kangs, kang_size, cudaMemcpyDeviceToHost);
 	int res = 0;
 	for (int i = 0; i < KangCnt; i++)
 	{
 		EcPoint Pnt, p;
-		Pnt.LoadFromBuffer64((u8*)&kangs[i * 12 + 0]);
+		Pnt.LoadFromBuffer64((u8 *)&kangs[i * 12 + 0]);
 		EcInt dist;
 		dist.Set(0);
 		memcpy(dist.data, &kangs[i * 12 + 8], 24);
@@ -401,7 +422,7 @@ int RCGpuKang::Dbg_CheckKangs()
 		if (dist.data[2] >> 63)
 		{
 			neg = true;
-			memset(((u8*)dist.data) + 24, 0xFF, 16);
+			memset(((u8 *)dist.data) + 24, 0xFF, 16);
 			dist.Neg();
 		}
 		p = ec.MultiplyG_Fast(dist);
@@ -409,11 +430,10 @@ int RCGpuKang::Dbg_CheckKangs()
 			p.y.NegModP();
 		if (i < KangCnt / 3)
 			p = p;
+		else if (i < 2 * KangCnt / 3)
+			p = ec.AddPoints(PntA, p);
 		else
-			if (i < 2 * KangCnt / 3)
-				p = ec.AddPoints(PntA, p);
-			else
-				p = ec.AddPoints(PntB, p);
+			p = ec.AddPoints(PntB, p);
 		if (!p.IsEqual(Pnt))
 			res++;
 	}
@@ -422,9 +442,86 @@ int RCGpuKang::Dbg_CheckKangs()
 }
 #endif
 
+bool RCGpuKang::SaveProgress()
+{
+	size_t bytes = (size_t)KangCnt * 96;
+	u8 *host = (u8 *)malloc(bytes);
+	cudaError_t err = cudaMemcpy(host, Kparams.Kangs, bytes, cudaMemcpyDeviceToHost);
+	if (err != cudaSuccess)
+	{
+		free(host);
+		return false;
+	}
+#ifdef _WIN32
+	_mkdir("PROGRESS");
+#else
+	mkdir("PROGRESS", 0777);
+#endif
+	FILE *f = fopen(ProgressFileName, "wb");
+	if (!f)
+	{
+		free(host);
+		return false;
+	}
+	ProgressHeader hdr;
+	memset(&hdr, 0, sizeof(hdr));
+	memcpy(hdr.magic, "RCKANGPROGv1", 12);
+	hdr.version = 1;
+	hdr.range = (u32)Range;
+	hdr.dp = (u32)DP;
+	hdr.kangCnt = (u32)KangCnt;
+	hdr.blockSize = Kparams.BlockSize;
+	hdr.groupCnt = Kparams.GroupCnt;
+	hdr.cudaIndex = (u32)CudaIndex;
+	size_t w1 = fwrite(&hdr, 1, sizeof(hdr), f);
+	size_t w2 = fwrite(host, 1, bytes, f);
+	int ok = fflush(f);
+#ifdef _WIN32
+	if (ok == 0)
+		ok = _commit(_fileno(f));
+#else
+	if (ok == 0)
+		ok = fsync(fileno(f));
+#endif
+	fclose(f);
+	free(host);
+	return w1 == sizeof(hdr) && w2 == bytes && ok == 0;
+}
+
+bool RCGpuKang::LoadProgress()
+{
+	FILE *f = fopen(ProgressFileName, "rb");
+	if (!f)
+		return false;
+	ProgressHeader hdr;
+	size_t r = fread(&hdr, 1, sizeof(hdr), f);
+	if (r != sizeof(hdr))
+	{
+		fclose(f);
+		return false;
+	}
+	if (memcmp(hdr.magic, "RCKANGPROGv1", 12) != 0 || hdr.version != 1 || hdr.range != (u32)Range || hdr.dp != (u32)DP || hdr.kangCnt != (u32)KangCnt)
+	{
+		fclose(f);
+		return false;
+	}
+	size_t bytes = (size_t)hdr.kangCnt * 96;
+	u8 *host = (u8 *)malloc(bytes);
+	size_t rr = fread(host, 1, bytes, f);
+	fclose(f);
+	if (rr != bytes)
+	{
+		free(host);
+		return false;
+	}
+	cudaError_t err = cudaMemcpy(Kparams.Kangs, host, bytes, cudaMemcpyHostToDevice);
+	free(host);
+	return err == cudaSuccess;
+}
+
 extern u32 gTotalErrors;
 
-//executes in separate thread
+// executes in separate thread
 void RCGpuKang::Execute()
 {
 	cudaSetDevice(CudaIndex);
@@ -437,7 +534,7 @@ void RCGpuKang::Execute()
 #ifdef DEBUG_MODE
 	u64 iter = 1;
 #endif
-	cudaError_t err;	
+	cudaError_t err;
 	while (!StopFlag)
 	{
 		u64 t1 = GetTickCount64();
@@ -453,7 +550,7 @@ void RCGpuKang::Execute()
 			gTotalErrors++;
 			break;
 		}
-		
+
 		if (cnt >= MAX_DP_CNT)
 		{
 			cnt = MAX_DP_CNT;
@@ -472,22 +569,31 @@ void RCGpuKang::Execute()
 			AddPointsToList(DPs_out, cnt, (u64)KangCnt * STEP_CNT);
 		}
 
-		//dbg
+		// dbg
 		cudaMemcpy(dbg, Kparams.dbg_buf, 1024, cudaMemcpyDeviceToHost);
 
 		u32 lcnt;
 		cudaMemcpy(&lcnt, Kparams.LoopedKangs, 4, cudaMemcpyDeviceToHost);
-		//printf("GPU %d, Looped: %d\r\n", CudaIndex, lcnt);
+		// printf("GPU %d, Looped: %d\r\n", CudaIndex, lcnt);
 
 		u64 t2 = GetTickCount64();
 		u64 tm = t2 - t1;
 		if (!tm)
 			tm = 1;
 		int cur_speed = (int)(pnt_cnt / (tm * 1000));
-		//printf("GPU %d kernel time %d ms, speed %d MH\r\n", CudaIndex, (int)tm, cur_speed);
+		// printf("GPU %d kernel time %d ms, speed %d MH\r\n", CudaIndex, (int)tm, cur_speed);
 
 		SpeedStats[cur_stats_ind] = cur_speed;
 		cur_stats_ind = (cur_stats_ind + 1) % STATS_WND_SIZE;
+		if (gProgressIntervalSec > 0)
+		{
+			u64 now = GetTickCount64();
+			if (now - lastSaveTick >= (u64)gProgressIntervalSec * 1000ull)
+			{
+				SaveProgress();
+				lastSaveTick = now;
+			}
+		}
 
 #ifdef DEBUG_MODE
 		if ((iter % 300) == 0)
@@ -508,10 +614,50 @@ void RCGpuKang::Execute()
 	Release();
 }
 
+// int RCGpuKang::GetStatsSpeed()
+// {
+// 	int res = SpeedStats[0];
+// 	for (int i = 1; i < STATS_WND_SIZE; i++)
+// 		res += SpeedStats[i];
+// 	return res / STATS_WND_SIZE;
+// }
+
 int RCGpuKang::GetStatsSpeed()
 {
-	int res = SpeedStats[0];
-	for (int i = 1; i < STATS_WND_SIZE; i++)
-		res += SpeedStats[i];
-	return res / STATS_WND_SIZE;
+	static int last_idx[MAX_GPU_CNT];
+	static u64 last_ms[MAX_GPU_CNT];
+	static long long last_sum[MAX_GPU_CNT];
+	static int last_xor[MAX_GPU_CNT];
+	static unsigned char init = 0;
+	if (!init)
+	{
+		for (int i = 0; i < MAX_GPU_CNT; ++i)
+		{
+			last_idx[i] = -1;
+			last_ms[i] = 0;
+			last_sum[i] = 0;
+			last_xor[i] = 0;
+		}
+		init = 1;
+	}
+	long long sum = 0;
+	int xr = 0;
+	for (int i = 0; i < STATS_WND_SIZE; ++i)
+	{
+		int v = SpeedStats[i];
+		sum += v;
+		xr ^= v;
+	}
+	int idx = cur_stats_ind;
+	u64 now = GetTickCount64();
+	if (idx == last_idx[CudaIndex] && last_ms[CudaIndex] != 0 && now - last_ms[CudaIndex] > 3000ull && sum == last_sum[CudaIndex] && xr == last_xor[CudaIndex])
+	{
+		last_ms[CudaIndex] = now;
+		return 0;
+	}
+	last_idx[CudaIndex] = idx;
+	last_ms[CudaIndex] = now;
+	last_sum[CudaIndex] = sum;
+	last_xor[CudaIndex] = xr;
+	return (int)(sum / STATS_WND_SIZE);
 }
