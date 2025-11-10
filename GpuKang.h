@@ -33,6 +33,7 @@ struct ProgressHeader
 	u32 blockSize;
 	u32 groupCnt;
 	u32 cudaIndex;
+	u64 uptimeSec;
 };
 
 class RCGpuKang
@@ -64,6 +65,9 @@ private:
 	char ProgressFileName[1024];
 	u64 lastSaveTick;
 
+	u64 startTick;
+	u64 savedUptimeSec;
+
 	void GenerateRndDistances();
 	bool Start();
 	void Release();
@@ -89,4 +93,5 @@ public:
 	bool LoadProgress();
 
 	int GetStatsSpeed();
+	u64 GetUptimeDays() const;
 };

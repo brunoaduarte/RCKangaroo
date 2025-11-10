@@ -59,7 +59,7 @@ int gProgressIntervalSec;
 
 bool gSaveCheckpoints = false;
 std::string gClientID;
-std::string gSoftVersion = "3.6";
+std::string gSoftVersion = "3.61";
 int gLastCheckpointDay = -1;
 std::string gRawParams;
 #include <ctime>
@@ -351,6 +351,22 @@ void AddCheckpointsToList(u8 *pPntList2, int cnt)
 	csCheckpoints.Leave();
 }
 
+// void GenerateCheckpointFileName()
+// {
+// 	time_t now = time(nullptr);
+// 	struct tm *t = localtime(&now);
+// 	char datebuf[9];
+// 	snprintf(datebuf, sizeof(datebuf), "%02d-%02d-%02d",
+// 			 t->tm_mday, t->tm_mon + 1, (t->tm_year + 1900) % 100);
+
+// 	snprintf(gCheckpointFileName, sizeof(gCheckpointFileName),
+// 			 "CHECKPOINTS.%s.%s.%s.%s.TXT",
+// 			 datebuf,
+// 			 gClientID.c_str(),
+// 			 gMachineIdHash4.c_str(),
+// 			 gParamsHash4.c_str());
+// }
+
 void GenerateCheckpointFileName()
 {
 	time_t now = time(nullptr);
@@ -358,12 +374,22 @@ void GenerateCheckpointFileName()
 	char datebuf[9];
 	snprintf(datebuf, sizeof(datebuf), "%02d-%02d-%02d",
 			 t->tm_mday, t->tm_mon + 1, (t->tm_year + 1900) % 100);
-
+	std::string up = "UP";
+	for (int i = 0; i < GpuCnt; ++i)
+	{
+		if (!GpuKangs[i])
+			continue;
+		up += "-";
+		char buf[32];
+		snprintf(buf, sizeof(buf), "%llu", (unsigned long long)GpuKangs[i]->GetUptimeDays());
+		up += buf;
+	}
 	snprintf(gCheckpointFileName, sizeof(gCheckpointFileName),
-			 "CHECKPOINTS.%s.%s.%s.%s.TXT",
+			 "CHECKPOINTS.%s.%s.%s.%s.%s.TXT",
 			 datebuf,
 			 gClientID.c_str(),
 			 gMachineIdHash4.c_str(),
+			 up.c_str(),
 			 gParamsHash4.c_str());
 }
 
@@ -920,7 +946,7 @@ bool ParseCommandLine(int argc, char *argv[])
 		{
 			int val = atoi(argv[ci]);
 			ci++;
-			if (val < 10)
+			if ((val < 10) || (val > 3600))
 			{
 				printf("error: invalid value for -progress option\r\n");
 				return false;
@@ -1025,7 +1051,8 @@ void InitMachineIdHash()
 		}
 	}
 
-	std::string material = Norm(gMachineId) + "|" + exePath + gpuFP;
+	// std::string material = Norm(gMachineId) + "|" + exePath + gpuFP;
+	std::string material = Norm(gMachineId) + "|" + gpuFP;
 	const uint32_t mh = FNV1a16(material);
 	std::ostringstream oss;
 	oss << std::hex << std::nouppercase << std::setw(4) << std::setfill('0') << mh;
@@ -1033,7 +1060,7 @@ void InitMachineIdHash()
 
 	// DEBUG DUMP (remove after check)
 	{
-		std::string host = Norm(gMachineId);
+		// std::string host = Norm(gMachineId);
 		// printf("[MachineHash] host: '%s'\n", host.c_str());
 		// printf("[MachineHash] exePath: '%s'\n", exePath.c_str());
 		// printf("[MachineHash] gpuFP: '%s'\n", gpuFP.c_str());

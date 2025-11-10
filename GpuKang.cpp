@@ -22,6 +22,35 @@ extern std::string gMachineIdHash4;
 extern std::string gParamsHash4;
 extern int gProgressIntervalSec;
 
+u64 RCGpuKang::GetUptimeDays() const
+{
+	u64 now = GetTickCount64();
+	u64 runSec = 0;
+	if (startTick && now >= startTick)
+		runSec = (now - startTick) / 1000ull;
+	return (savedUptimeSec + runSec) / 86400ull;
+}
+
+static std::string GpuIdHex(int cudaIndex)
+{
+	cudaDeviceProp dp{};
+	if (cudaGetDeviceProperties(&dp, cudaIndex) != cudaSuccess)
+		return "unknown";
+#if defined(CUDART_VERSION) && (CUDART_VERSION >= 10000)
+	const unsigned char *u = reinterpret_cast<const unsigned char *>(&dp.uuid);
+	char ubuf[33];
+	for (int k = 0; k < 16; ++k)
+		sprintf(ubuf + k * 2, "%02x", u[k]);
+	ubuf[32] = '\0';
+	return std::string(ubuf);
+#else
+	char buf[32];
+	snprintf(buf, sizeof(buf), "%08x%02x%02x",
+			 (unsigned)dp.pciDomainID, (unsigned)dp.pciBusID, (unsigned)dp.pciDeviceID);
+	return std::string(buf);
+#endif
+}
+
 cudaError_t cuSetGpuParams(TKparams Kparams, u64 *_jmp2_table);
 void CallGpuKernelGen(TKparams Kparams);
 void CallGpuKernelABC(TKparams Kparams);
@@ -70,9 +99,18 @@ bool RCGpuKang::Prepare(EcPoint _PntToSolve, int _Range, int _DP, EcJMP *_EcJump
 	Kparams.KernelC_LDS_Size = 96 * JMP_CNT;
 	Kparams.IsGenMode = gGenMode;
 
-	snprintf(ProgressFileName, sizeof(ProgressFileName), "PROGRESS/PROGRESS.%s.%s.gpu%d.BIN", gMachineIdHash4.c_str(), gParamsHash4.c_str(), CudaIndex);
+	const std::string gpuId = GpuIdHex(CudaIndex);
+	// snprintf(ProgressFileName, sizeof(ProgressFileName),
+	// 		 "PROGRESS/PROGRESS.%s.%s.BIN",
+	// 		 gpuId.c_str(), gParamsHash4.c_str());
+
+	snprintf(ProgressFileName, sizeof(ProgressFileName),
+			 "PROGRESS/PROGRESS.GPU.%s.%s.BIN",
+			 gpuId.c_str(), gParamsHash4.c_str());
 
 	lastSaveTick = GetTickCount64();
+	savedUptimeSec = 0;
+	startTick = 0;
 
 	// allocate gpu mem
 	u64 size;
@@ -393,7 +431,13 @@ bool RCGpuKang::Start()
 	}
 	else
 	{
-		printf("GPU %d: loaded progress from %s\n", CudaIndex, ProgressFileName);
+		unsigned long long s = (unsigned long long)savedUptimeSec;
+		unsigned long long d = s / 86400ull;
+		unsigned long long h = (s % 86400ull) / 3600ull;
+		unsigned long long m = (s % 3600ull) / 60ull;
+		unsigned long long sec = s % 60ull;
+		printf("GPU %d: LoadProgress, Uptime %llud:%02lluh:%02llum:%02llus\n",
+			   CudaIndex, d, h, m, sec);
 	}
 
 	err = cudaMemset(Kparams.L1S2, 0, mpCnt * Kparams.BlockSize * 8);
@@ -401,6 +445,7 @@ bool RCGpuKang::Start()
 		return false;
 	cudaMemset(Kparams.dbg_buf, 0, 1024);
 	cudaMemset(Kparams.LoopTable, 0, KangCnt * MD_LEN * sizeof(u64));
+	startTick = GetTickCount64();
 	return true;
 }
 
@@ -457,22 +502,30 @@ bool RCGpuKang::SaveProgress()
 #else
 	mkdir("PROGRESS", 0777);
 #endif
+
 	FILE *f = fopen(ProgressFileName, "wb");
 	if (!f)
 	{
 		free(host);
 		return false;
 	}
+	u64 now = GetTickCount64();
+	u64 runSec = 0;
+	if (startTick && now >= startTick)
+		runSec = (now - startTick) / 1000ull;
+
 	ProgressHeader hdr;
 	memset(&hdr, 0, sizeof(hdr));
-	memcpy(hdr.magic, "RCKANGPROGv1", 12);
-	hdr.version = 1;
+	memcpy(hdr.magic, "RCKANGPROGv2", 12);
+	hdr.version = 2;
 	hdr.range = (u32)Range;
 	hdr.dp = (u32)DP;
 	hdr.kangCnt = (u32)KangCnt;
 	hdr.blockSize = Kparams.BlockSize;
 	hdr.groupCnt = Kparams.GroupCnt;
 	hdr.cudaIndex = (u32)CudaIndex;
+	hdr.uptimeSec = savedUptimeSec + runSec;
+
 	size_t w1 = fwrite(&hdr, 1, sizeof(hdr), f);
 	size_t w2 = fwrite(host, 1, bytes, f);
 	int ok = fflush(f);
@@ -485,7 +538,19 @@ bool RCGpuKang::SaveProgress()
 #endif
 	fclose(f);
 	free(host);
-	return w1 == sizeof(hdr) && w2 == bytes && ok == 0;
+
+	bool success = (w1 == sizeof(hdr)) && (w2 == bytes) && (ok == 0);
+	if (success)
+	{
+		unsigned long long s = (unsigned long long)hdr.uptimeSec;
+		unsigned long long d = s / 86400ull;
+		unsigned long long h = (s % 86400ull) / 3600ull;
+		unsigned long long m = (s % 3600ull) / 60ull;
+		unsigned long long sec = s % 60ull;
+		printf("GPU %d:  SaveProgress, Uptime %llud:%02lluh:%02llum:%02llus\n",
+			   CudaIndex, d, h, m, sec);
+	}
+	return success;
 }
 
 bool RCGpuKang::LoadProgress()
@@ -500,11 +565,13 @@ bool RCGpuKang::LoadProgress()
 		fclose(f);
 		return false;
 	}
-	if (memcmp(hdr.magic, "RCKANGPROGv1", 12) != 0 || hdr.version != 1 || hdr.range != (u32)Range || hdr.dp != (u32)DP || hdr.kangCnt != (u32)KangCnt)
+	if (memcmp(hdr.magic, "RCKANGPROGv2", 12) != 0 || hdr.version != 2 ||
+		hdr.range != (u32)Range || hdr.dp != (u32)DP || hdr.kangCnt != (u32)KangCnt)
 	{
 		fclose(f);
 		return false;
 	}
+	savedUptimeSec = hdr.uptimeSec;
 	size_t bytes = (size_t)hdr.kangCnt * 96;
 	u8 *host = (u8 *)malloc(bytes);
 	size_t rr = fread(host, 1, bytes, f);
