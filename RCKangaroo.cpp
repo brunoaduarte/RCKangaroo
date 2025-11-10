@@ -3,7 +3,6 @@
 // License: GPLv3, see "LICENSE.TXT" file
 // https://github.com/RetiredC
 
-
 #include <iostream>
 #include <vector>
 
@@ -14,12 +13,11 @@
 #include "utils.h"
 #include "GpuKang.h"
 
-
 EcJMP EcJumps1[JMP_CNT];
 EcJMP EcJumps2[JMP_CNT];
 EcJMP EcJumps3[JMP_CNT];
 
-RCGpuKang* GpuKangs[MAX_GPU_CNT];
+RCGpuKang *GpuKangs[MAX_GPU_CNT];
 int GpuCnt;
 volatile long ThrCnt;
 volatile bool gSolved;
@@ -31,8 +29,8 @@ EcInt Int_TameOffset;
 Ec ec;
 
 CriticalSection csAddPoints;
-u8* pPntList;
-u8* pPntList2;
+u8 *pPntList;
+u8 *pPntList2;
 volatile int PntIndex;
 TFastBase db;
 EcPoint gPntToSolve;
@@ -52,15 +50,37 @@ EcPoint gPubKey;
 u8 gGPUs_Mask[MAX_GPU_CNT];
 char gTamesFileName[1024];
 double gMax;
-bool gGenMode; //tames generation mode
+bool gGenMode; // tames generation mode
 bool gIsOpsLimit;
+
+//
+
+bool gSaveCheckpoints = false;
+std::string gClientID;
+std::string gSoftVersion = "3.35";
+int gLastCheckpointDay = -1;
+std::string gRawParams;
+#include <ctime>
+#include <cstdio>
+#include <string>
+#include <sstream>
+#include <iomanip>
+#include <functional>
+#include <fstream>
+#include <vector>
+char gCheckpointFileName[1024] = {0};
+static std::vector<std::string> gPoolCheckpoints;
+static size_t gSavedLines = 0;
+static constexpr char ACK_MARK[] = "[ACK]";
+
+//
 
 #pragma pack(push, 1)
 struct DBRec
 {
 	u8 x[12];
 	u8 d[22];
-	u8 type; //0 - tame, 1 - wild1, 2 - wild2
+	u8 type; // 0 - tame, 1 - wild1, 2 - wild2
 };
 #pragma pack(pop)
 
@@ -72,7 +92,7 @@ void InitGpus()
 	if (gcnt > MAX_GPU_CNT)
 		gcnt = MAX_GPU_CNT;
 
-//	gcnt = 1; //dbg
+	//	gcnt = 1; //dbg
 	if (!gcnt)
 		return;
 
@@ -99,7 +119,7 @@ void InitGpus()
 		cudaDeviceProp deviceProp;
 		cudaGetDeviceProperties(&deviceProp, i);
 		printf("GPU %d: %s, %.2f GB, %d CUs, cap %d.%d, PCI %d, L2 size: %d KB\r\n", i, deviceProp.name, ((float)(deviceProp.totalGlobalMem / (1024 * 1024))) / 1024.0f, deviceProp.multiProcessorCount, deviceProp.major, deviceProp.minor, deviceProp.pciBusID, deviceProp.l2CacheSize / 1024);
-		
+
 		if (deviceProp.major < 6)
 		{
 			printf("GPU %d - not supported, skip\r\n", i);
@@ -118,23 +138,24 @@ void InitGpus()
 	printf("Total GPUs for work: %d\r\n", GpuCnt);
 }
 #ifdef _WIN32
-u32 __stdcall kang_thr_proc(void* data)
+u32 __stdcall kang_thr_proc(void *data)
 {
-	RCGpuKang* Kang = (RCGpuKang*)data;
+	RCGpuKang *Kang = (RCGpuKang *)data;
 	Kang->Execute();
 	InterlockedDecrement(&ThrCnt);
 	return 0;
 }
 #else
-void* kang_thr_proc(void* data)
+void *kang_thr_proc(void *data)
 {
-	RCGpuKang* Kang = (RCGpuKang*)data;
+	RCGpuKang *Kang = (RCGpuKang *)data;
 	Kang->Execute();
 	__sync_fetch_and_sub(&ThrCnt, 1);
 	return 0;
 }
 #endif
-void AddPointsToList(u32* data, int pnt_cnt, u64 ops_cnt)
+
+void AddPointsToList(u32 *data, int pnt_cnt, u64 ops_cnt)
 {
 	csAddPoints.Enter();
 	if (PntIndex + pnt_cnt >= MAX_CNT_LIST)
@@ -149,7 +170,7 @@ void AddPointsToList(u32* data, int pnt_cnt, u64 ops_cnt)
 	csAddPoints.Leave();
 }
 
-bool Collision_SOTA(EcPoint& pnt, EcInt t, int TameType, EcInt w, int WildType, bool IsNeg)
+bool Collision_SOTA(EcPoint &pnt, EcInt t, int TameType, EcInt w, int WildType, bool IsNeg)
 {
 	if (IsNeg)
 		t.Neg();
@@ -188,6 +209,135 @@ bool Collision_SOTA(EcPoint& pnt, EcInt t, int TameType, EcInt w, int WildType, 
 	}
 }
 
+void AddCheckpointsToList(u8 *pPntList2, int cnt)
+{
+	gPoolCheckpoints.reserve(gPoolCheckpoints.size() + cnt);
+	for (int i = 0; i < cnt; ++i)
+	{
+		u8 *p = pPntList2 + i * GPU_DP_SIZE;
+		char buf[104];
+		for (int j = 0; j < 12; ++j)
+			sprintf(buf + j * 2, "%02x", p[11 - j]);
+		buf[24] = ' ';
+		u8 d[24];
+		for (int j = 0; j < 24; ++j)
+			d[j] = p[16 + j];
+		if ((d[23] & 0xF0) == 0xF0)
+		{
+			u8 result[24];
+			int borrow = 0;
+			for (int k = 0; k < 24; ++k)
+			{
+				int sub = 0xFF - d[k] - borrow;
+				if (sub < 0)
+				{
+					sub += 0x100;
+					borrow = 1;
+				}
+				else
+				{
+					borrow = 0;
+				}
+				result[k] = sub;
+			}
+			borrow = 1;
+			for (int k = 0; k < 24; ++k)
+			{
+				int sum = result[k] + borrow;
+				result[k] = sum & 0xFF;
+				borrow = (sum > 0xFF) ? 1 : 0;
+			}
+			for (int k = 0; k < 24; ++k)
+				d[k] = result[k];
+		}
+		for (int j = 0; j < 8; ++j)
+			sprintf(buf + 25 + j * 2, "00");
+		for (int j = 0; j < 24; ++j)
+			sprintf(buf + 41 + j * 2, "%02x", d[23 - j]);
+		int type = p[40];
+		snprintf(buf + 25 + 64, 16, " TYPE:%d", type);
+		gPoolCheckpoints.emplace_back(buf);
+	}
+}
+
+void GenerateCheckpointFileName()
+{
+	time_t now = time(nullptr);
+	struct tm *t = localtime(&now);
+	char datebuf[9];
+	snprintf(datebuf, sizeof(datebuf), "%02d-%02d-%02d",
+			 t->tm_mday, t->tm_mon + 1, (t->tm_year + 1900) % 100);
+	char hexBufX[65] = {0};
+	char hexBufY[65] = {0};
+	char hexBufStart[129] = {0};
+	gPubKey.x.GetHexStr(hexBufX);
+	gPubKey.y.GetHexStr(hexBufY);
+	gStart.GetHexStr(hexBufStart);
+
+	std::string toHash =
+		std::to_string(gDP) +
+		std::to_string(gRange) +
+		hexBufStart +
+		hexBufX +
+		hexBufY;
+	uint32_t rawHash = static_cast<uint32_t>(
+		std::hash<std::string>{}(toHash) & 0xFFFF);
+	std::ostringstream oss;
+	oss << std::hex << std::setw(4) << std::setfill('0') << rawHash;
+	std::string hashShort = oss.str();
+	snprintf(gCheckpointFileName, sizeof(gCheckpointFileName),
+			 "CHECKPOINTS.%s.%s.%s.TXT",
+			 datebuf,
+			 gClientID.c_str(),
+			 hashShort.c_str());
+}
+
+void SaveInitialParamsToFile()
+{
+	std::ifstream check(gCheckpointFileName);
+	if (check.good())
+		return;
+	FILE *f = fopen(gCheckpointFileName, "a");
+	if (f)
+	{
+		fprintf(f, "%s\n", gRawParams.c_str());
+		fclose(f);
+	}
+	else
+	{
+		printf("Error: cannot create initial checkpoint file.\n");
+	}
+}
+
+void SaveCheckpointToFile()
+{
+	size_t total_lines = gPoolCheckpoints.size();
+	if (gSavedLines >= total_lines)
+		return;
+	std::string buffer;
+	buffer.reserve((total_lines - gSavedLines) * 90);
+	for (size_t i = gSavedLines; i < total_lines; ++i)
+	{
+		buffer += gPoolCheckpoints[i];
+		bool is_last = (i + 1 == total_lines) && (gSavedLines == total_lines);
+		if (is_last)
+			buffer.append(ACK_MARK);
+		buffer.push_back('\n');
+	}
+	FILE *f = fopen(gCheckpointFileName, "a");
+	if (!f)
+	{
+		printf("Error: cannot open checkpoint file for appending.\n");
+		return;
+	}
+	size_t written = fwrite(buffer.data(), 1, buffer.size(), f);
+	if (written != buffer.size())
+	{
+		printf("Error: failed to write checkpoint lines to file.\n");
+	}
+	fclose(f);
+	gSavedLines = total_lines;
+}
 
 void CheckNewPoints()
 {
@@ -203,23 +353,28 @@ void CheckNewPoints()
 	PntIndex = 0;
 	csAddPoints.Leave();
 
+	if (gSaveCheckpoints)
+	{
+		AddCheckpointsToList(pPntList2, cnt);
+	}
+
 	for (int i = 0; i < cnt; i++)
 	{
 		DBRec nrec;
-		u8* p = pPntList2 + i * GPU_DP_SIZE;
+		u8 *p = pPntList2 + i * GPU_DP_SIZE;
 		memcpy(nrec.x, p, 12);
 		memcpy(nrec.d, p + 16, 22);
 		nrec.type = gGenMode ? TAME : p[40];
 
-		DBRec* pref = (DBRec*)db.FindOrAddDataBlock((u8*)&nrec);
+		DBRec *pref = (DBRec *)db.FindOrAddDataBlock((u8 *)&nrec);
 		if (gGenMode)
 			continue;
 		if (pref)
 		{
-			//in db we dont store first 3 bytes so restore them
+			// in db we dont store first 3 bytes so restore them
 			DBRec tmp_pref;
 			memcpy(&tmp_pref, &nrec, 3);
-			memcpy(((u8*)&tmp_pref) + 3, pref, sizeof(DBRec) - 3);
+			memcpy(((u8 *)&tmp_pref) + 3, pref, sizeof(DBRec) - 3);
 			pref = &tmp_pref;
 
 			if (pref->type == nrec.type)
@@ -227,10 +382,10 @@ void CheckNewPoints()
 				if (pref->type == TAME)
 					continue;
 
-				//if it's wild, we can find the key from the same type if distances are different
-				if (*(u64*)pref->d == *(u64*)nrec.d)
+				// if it's wild, we can find the key from the same type if distances are different
+				if (*(u64 *)pref->d == *(u64 *)nrec.d)
 					continue;
-				//else
+				// else
 				//	ToLog("key found by same wild");
 			}
 
@@ -239,18 +394,22 @@ void CheckNewPoints()
 			if (pref->type != TAME)
 			{
 				memcpy(w.data, pref->d, sizeof(pref->d));
-				if (pref->d[21] == 0xFF) memset(((u8*)w.data) + 22, 0xFF, 18);
+				if (pref->d[21] == 0xFF)
+					memset(((u8 *)w.data) + 22, 0xFF, 18);
 				memcpy(t.data, nrec.d, sizeof(nrec.d));
-				if (nrec.d[21] == 0xFF) memset(((u8*)t.data) + 22, 0xFF, 18);
+				if (nrec.d[21] == 0xFF)
+					memset(((u8 *)t.data) + 22, 0xFF, 18);
 				TameType = nrec.type;
 				WildType = pref->type;
 			}
 			else
 			{
 				memcpy(w.data, nrec.d, sizeof(nrec.d));
-				if (nrec.d[21] == 0xFF) memset(((u8*)w.data) + 22, 0xFF, 18);
+				if (nrec.d[21] == 0xFF)
+					memset(((u8 *)w.data) + 22, 0xFF, 18);
 				memcpy(t.data, pref->d, sizeof(pref->d));
-				if (pref->d[21] == 0xFF) memset(((u8*)t.data) + 22, 0xFF, 18);
+				if (pref->d[21] == 0xFF)
+					memset(((u8 *)t.data) + 22, 0xFF, 18);
 				TameType = TAME;
 				WildType = nrec.type;
 			}
@@ -259,8 +418,8 @@ void CheckNewPoints()
 			if (!res)
 			{
 				bool w12 = ((pref->type == WILD1) && (nrec.type == WILD2)) || ((pref->type == WILD2) && (nrec.type == WILD1));
-				if (w12) //in rare cases WILD and WILD2 can collide in mirror, in this case there is no way to find K
-					;// ToLog("W1 and W2 collides in mirror");
+				if (w12) // in rare cases WILD and WILD2 can collide in mirror, in this case there is no way to find K
+					;	 // ToLog("W1 and W2 collides in mirror");
 				else
 				{
 					printf("Collision Error\r\n");
@@ -289,34 +448,66 @@ void ShowStats(u64 tm_start, double exp_ops, double dp_val)
 	}
 #endif
 
+	if (gSaveCheckpoints)
+	{
+		time_t now = time(nullptr);
+		struct tm *tmNow = localtime(&now);
+		int day = tmNow->tm_mday;
+		if (day != gLastCheckpointDay)
+		{
+			gLastCheckpointDay = day;
+			GenerateCheckpointFileName();
+			SaveInitialParamsToFile();
+		}
+	}
+	if (gSaveCheckpoints)
+	{
+		SaveCheckpointToFile();
+	}
+
 	int speed = GpuKangs[0]->GetStatsSpeed();
 	for (int i = 1; i < GpuCnt; i++)
 		speed += GpuKangs[i]->GetStatsSpeed();
 
 	u64 est_dps_cnt = (u64)(exp_ops / dp_val);
+
 	u64 exp_sec = 0xFFFFFFFFFFFFFFFFull;
 	if (speed)
-		exp_sec = (u64)((exp_ops / 1000000) / speed); //in sec
-	u64 exp_days = exp_sec / (3600 * 24);
-	int exp_hours = (int)(exp_sec - exp_days * (3600 * 24)) / 3600;
-	int exp_min = (int)(exp_sec - exp_days * (3600 * 24) - exp_hours * 3600) / 60;
+		exp_sec = (u64)((exp_ops / 1000000) / speed);
 
-	u64 sec = (GetTickCount64() - tm_start) / 1000;
-	u64 days = sec / (3600 * 24);
-	int hours = (int)(sec - days * (3600 * 24)) / 3600;
-	int min = (int)(sec - days * (3600 * 24) - hours * 3600) / 60;
-	 
-	printf("%sSpeed: %d MKeys/s, Err: %d, DPs: %lluK/%lluK, Time: %llud:%02dh:%02dm/%llud:%02dh:%02dm\r\n", gGenMode ? "GEN: " : (IsBench ? "BENCH: " : "MAIN: "), speed, gTotalErrors, db.GetBlockCnt()/1000, est_dps_cnt/1000, days, hours, min, exp_days, exp_hours, exp_min);
+	u64 exp_days = exp_sec / 86400;
+	u64 exp_hours = (exp_sec % 86400) / 3600;
+	u64 exp_min = (exp_sec % 3600) / 60;
+
+	u64 exp_years = exp_days / 365;
+	u64 rem_days = exp_days % 365;
+
+	u64 elapsed_sec = (GetTickCount64() - tm_start) / 1000;
+	u64 days = elapsed_sec / 86400;
+	u64 hours = (elapsed_sec % 86400) / 3600;
+	u64 min = (elapsed_sec % 3600) / 60;
+	u64 sec = elapsed_sec % 60;
+
+	const char *mode_str = gGenMode	 ? "GEN: "
+						   : IsBench ? "BENCH: "
+									 : "MAIN: ";
+
+	printf("\n%s\n", mode_str);
+	printf("%-8s%d MKeys/s, Err: %d\n", "Speed:", speed, gTotalErrors);
+	printf("%-8s%llu / %lluK\n", "DPs:", db.GetBlockCnt(), est_dps_cnt / 1000);
+	printf("%-8s%llud:%02lluh:%02llum:%02llus / %lluy:%llud:%02lluh:%02llum\n", "Time:",
+		   days, hours, min, sec,
+		   exp_years, rem_days, exp_hours, exp_min);
 }
 
-bool SolvePoint(EcPoint PntToSolve, int Range, int DP, EcInt* pk_res)
+bool SolvePoint(EcPoint PntToSolve, int Range, int DP, EcInt *pk_res)
 {
 	if ((Range < 32) || (Range > 180))
 	{
 		printf("Unsupported Range value (%d)!\r\n", Range);
 		return false;
 	}
-	if ((DP < 14) || (DP > 60)) 
+	if ((DP < 14) || (DP > 60))
 	{
 		printf("Unsupported DP value (%d)!\r\n", DP);
 		return false;
@@ -325,9 +516,9 @@ bool SolvePoint(EcPoint PntToSolve, int Range, int DP, EcInt* pk_res)
 	printf("\r\nSolving point: Range %d bits, DP %d, start...\r\n", Range, DP);
 	double ops = 1.15 * pow(2.0, Range / 2.0);
 	double dp_val = (double)(1ull << DP);
-	double ram = (32 + 4 + 4) * ops / dp_val; //+4 for grow allocation and memory fragmentation
-	ram += sizeof(TListRec) * 256 * 256 * 256; //3byte-prefix table
-	ram /= (1024 * 1024 * 1024); //GB
+	double ram = (32 + 4 + 4) * ops / dp_val;  //+4 for grow allocation and memory fragmentation
+	ram += sizeof(TListRec) * 256 * 256 * 256; // 3byte-prefix table
+	ram /= (1024 * 1024 * 1024);			   // GB
 	printf("SOTA method, estimated ops: 2^%.3f, RAM for DPs: %.3f GB. DP and GPU overheads not included!\r\n", log2(ops), ram);
 	gIsOpsLimit = false;
 	double MaxTotalOps = 0.0;
@@ -335,15 +526,15 @@ bool SolvePoint(EcPoint PntToSolve, int Range, int DP, EcInt* pk_res)
 	{
 		MaxTotalOps = gMax * ops;
 		double ram_max = (32 + 4 + 4) * MaxTotalOps / dp_val; //+4 for grow allocation and memory fragmentation
-		ram_max += sizeof(TListRec) * 256 * 256 * 256; //3byte-prefix table
-		ram_max /= (1024 * 1024 * 1024); //GB
+		ram_max += sizeof(TListRec) * 256 * 256 * 256;		  // 3byte-prefix table
+		ram_max /= (1024 * 1024 * 1024);					  // GB
 		printf("Max allowed number of ops: 2^%.3f, max RAM for DPs: %.3f GB\r\n", log2(MaxTotalOps), ram_max);
 	}
 
 	u64 total_kangs = GpuKangs[0]->CalcKangCnt();
 	for (int i = 1; i < GpuCnt; i++)
 		total_kangs += GpuKangs[i]->CalcKangCnt();
-	double path_single_kang = ops / total_kangs;	
+	double path_single_kang = ops / total_kangs;
 	double DPs_per_kang = path_single_kang / dp_val;
 	printf("Estimated DPs per kangaroo: %.3f.%s\r\n", DPs_per_kang, (DPs_per_kang < 5) ? " DP overhead is big, use less DP value if possible!" : "");
 
@@ -363,10 +554,10 @@ bool SolvePoint(EcPoint PntToSolve, int Range, int DP, EcInt* pk_res)
 			printf("tames loading failed\r\n");
 	}
 
-	SetRndSeed(0); //use same seed to make tames from file compatible
+	SetRndSeed(0); // use same seed to make tames from file compatible
 	PntTotalOps = 0;
 	PntIndex = 0;
-//prepare jumps
+	// prepare jumps
 	EcInt minjump, t;
 	minjump.Set(1);
 	minjump.ShiftLeft(Range / 2 + 3);
@@ -375,29 +566,29 @@ bool SolvePoint(EcPoint PntToSolve, int Range, int DP, EcInt* pk_res)
 		EcJumps1[i].dist = minjump;
 		t.RndMax(minjump);
 		EcJumps1[i].dist.Add(t);
-		EcJumps1[i].dist.data[0] &= 0xFFFFFFFFFFFFFFFE; //must be even
+		EcJumps1[i].dist.data[0] &= 0xFFFFFFFFFFFFFFFE; // must be even
 		EcJumps1[i].p = ec.MultiplyG(EcJumps1[i].dist);
 	}
 
 	minjump.Set(1);
-	minjump.ShiftLeft(Range - 10); //large jumps for L1S2 loops. Must be almost RANGE_BITS
+	minjump.ShiftLeft(Range - 10); // large jumps for L1S2 loops. Must be almost RANGE_BITS
 	for (int i = 0; i < JMP_CNT; i++)
 	{
 		EcJumps2[i].dist = minjump;
 		t.RndMax(minjump);
 		EcJumps2[i].dist.Add(t);
-		EcJumps2[i].dist.data[0] &= 0xFFFFFFFFFFFFFFFE; //must be even
+		EcJumps2[i].dist.data[0] &= 0xFFFFFFFFFFFFFFFE; // must be even
 		EcJumps2[i].p = ec.MultiplyG(EcJumps2[i].dist);
 	}
 
 	minjump.Set(1);
-	minjump.ShiftLeft(Range - 10 - 2); //large jumps for loops >2
+	minjump.ShiftLeft(Range - 10 - 2); // large jumps for loops >2
 	for (int i = 0; i < JMP_CNT; i++)
 	{
 		EcJumps3[i].dist = minjump;
 		t.RndMax(minjump);
 		EcJumps3[i].dist.Add(t);
-		EcJumps3[i].dist.data[0] &= 0xFFFFFFFFFFFFFFFE; //must be even
+		EcJumps3[i].dist.data[0] &= 0xFFFFFFFFFFFFFFFE; // must be even
 		EcJumps3[i].p = ec.MultiplyG(EcJumps3[i].dist);
 	}
 	SetRndSeed(GetTickCount64());
@@ -411,11 +602,11 @@ bool SolvePoint(EcPoint PntToSolve, int Range, int DP, EcInt* pk_res)
 	Int_TameOffset.ShiftLeft(Range - 1);
 	EcInt tt;
 	tt.Set(1);
-	tt.ShiftLeft(Range - 5); //half of tame range width
+	tt.ShiftLeft(Range - 5); // half of tame range width
 	Int_TameOffset.Sub(tt);
 	gPntToSolve = PntToSolve;
 
-//prepare GPUs
+	// prepare GPUs
 	for (int i = 0; i < GpuCnt; i++)
 		if (!GpuKangs[i]->Prepare(PntToSolve, Range, DP, EcJumps1, EcJumps2, EcJumps3))
 		{
@@ -438,9 +629,9 @@ bool SolvePoint(EcPoint PntToSolve, int Range, int DP, EcInt* pk_res)
 	for (int i = 0; i < GpuCnt; i++)
 	{
 #ifdef _WIN32
-		thr_handles[i] = (HANDLE)_beginthreadex(NULL, 0, kang_thr_proc, (void*)GpuKangs[i], 0, &ThreadID);
+		thr_handles[i] = (HANDLE)_beginthreadex(NULL, 0, kang_thr_proc, (void *)GpuKangs[i], 0, &ThreadID);
 #else
-		pthread_create(&thr_handles[i], NULL, kang_thr_proc, (void*)GpuKangs[i]);
+		pthread_create(&thr_handles[i], NULL, kang_thr_proc, (void *)GpuKangs[i]);
 #endif
 	}
 
@@ -462,7 +653,7 @@ bool SolvePoint(EcPoint PntToSolve, int Range, int DP, EcInt* pk_res)
 			break;
 		}
 	}
-
+	ShowStats(tm0, ops, dp_val);
 	printf("Stopping work ...\r\n");
 	for (int i = 0; i < GpuCnt; i++)
 		GpuKangs[i]->Stop();
@@ -482,7 +673,7 @@ bool SolvePoint(EcPoint PntToSolve, int Range, int DP, EcInt* pk_res)
 		if (gGenMode)
 		{
 			printf("saving tames...\r\n");
-			db.Header[0] = gRange; 
+			db.Header[0] = gRange;
 			if (db.SaveToFile(gTamesFileName))
 				printf("tames saved\r\n");
 			else
@@ -499,12 +690,12 @@ bool SolvePoint(EcPoint PntToSolve, int Range, int DP, EcInt* pk_res)
 	return true;
 }
 
-bool ParseCommandLine(int argc, char* argv[])
+bool ParseCommandLine(int argc, char *argv[])
 {
 	int ci = 1;
 	while (ci < argc)
 	{
-		char* argument = argv[ci];
+		char *argument = argv[ci];
 		ci++;
 		if (strcmp(argument, "-gpu") == 0)
 		{
@@ -513,7 +704,7 @@ bool ParseCommandLine(int argc, char* argv[])
 				printf("error: missed value after -gpu option\r\n");
 				return false;
 			}
-			char* gpus = argv[ci];
+			char *gpus = argv[ci];
 			ci++;
 			memset(gGPUs_Mask, 0, sizeof(gGPUs_Mask));
 			for (int i = 0; i < (int)strlen(gpus); i++)
@@ -526,8 +717,7 @@ bool ParseCommandLine(int argc, char* argv[])
 				gGPUs_Mask[gpus[i] - '0'] = 1;
 			}
 		}
-		else
-		if (strcmp(argument, "-dp") == 0)
+		else if (strcmp(argument, "-dp") == 0)
 		{
 			int val = atoi(argv[ci]);
 			ci++;
@@ -538,8 +728,7 @@ bool ParseCommandLine(int argc, char* argv[])
 			}
 			gDP = val;
 		}
-		else
-		if (strcmp(argument, "-range") == 0)
+		else if (strcmp(argument, "-range") == 0)
 		{
 			int val = atoi(argv[ci]);
 			ci++;
@@ -550,9 +739,8 @@ bool ParseCommandLine(int argc, char* argv[])
 			}
 			gRange = val;
 		}
-		else
-		if (strcmp(argument, "-start") == 0)
-		{	
+		else if (strcmp(argument, "-start") == 0)
+		{
 			if (!gStart.SetHexStr(argv[ci]))
 			{
 				printf("error: invalid value for -start option\r\n");
@@ -561,8 +749,7 @@ bool ParseCommandLine(int argc, char* argv[])
 			ci++;
 			gStartSet = true;
 		}
-		else
-		if (strcmp(argument, "-pubkey") == 0)
+		else if (strcmp(argument, "-pubkey") == 0)
 		{
 			if (!gPubKey.SetHexStr(argv[ci]))
 			{
@@ -571,14 +758,12 @@ bool ParseCommandLine(int argc, char* argv[])
 			}
 			ci++;
 		}
-		else
-		if (strcmp(argument, "-tames") == 0)
+		else if (strcmp(argument, "-tames") == 0)
 		{
 			strcpy(gTamesFileName, argv[ci]);
 			ci++;
 		}
-		else
-		if (strcmp(argument, "-max") == 0)
+		else if (strcmp(argument, "-max") == 0)
 		{
 			double val = atof(argv[ci]);
 			ci++;
@@ -589,12 +774,66 @@ bool ParseCommandLine(int argc, char* argv[])
 			}
 			gMax = val;
 		}
+		else if (strcmp(argument, "-nodeID") == 0)
+		{
+			if (ci >= argc)
+			{
+				printf("error: missing value after -nodeID option\n");
+				return false;
+			}
+			std::string id = argv[ci++];
+			if (id.empty() || id[0] != '@')
+			{
+				printf("error: nodeID must start with '@'\n");
+				return false;
+			}
+			if (id.length() > 20)
+			{
+				printf("error: nodeID length must not exceed 20 characters\n");
+				return false;
+			}
+			// for (size_t i = 1; i < id.length(); ++i)
+			// {
+			// 	if (!std::isalnum(static_cast<unsigned char>(id[i])))
+			// 	{
+			// 		printf("error: invalid character '%c' in nodeID\n", id[i]);
+			// 		return false;
+			// 	}
+			// }
+			gSaveCheckpoints = true;
+			gClientID = id;
+		}
 		else
 		{
 			printf("error: unknown option %s\r\n", argument);
 			return false;
 		}
 	}
+
+	if (gSaveCheckpoints)
+	{
+		printf("Checkpoint saving mode is enabled.\n");
+		gRawParams.clear();
+		for (int i = 1; i < argc; ++i)
+		{
+			if (strcmp(argv[i], "-dp") == 0 ||
+				strcmp(argv[i], "-range") == 0 ||
+				strcmp(argv[i], "-start") == 0 ||
+				strcmp(argv[i], "-pubkey") == 0)
+			{
+				if (!gRawParams.empty())
+					gRawParams += " ";
+				gRawParams += argv[i];
+				if ((i + 1) < argc)
+				{
+					gRawParams += " ";
+					gRawParams += argv[i + 1];
+					++i;
+				}
+			}
+		}
+	}
+
 	if (!gPubKey.x.IsZero())
 		if (!gStartSet || !gRange || !gDP)
 		{
@@ -610,21 +849,29 @@ bool ParseCommandLine(int argc, char* argv[])
 		}
 		gGenMode = true;
 	}
+	if (gSaveCheckpoints && gDP < 18)
+	{
+		printf("Error: to save checkpoints DP should be more than 18\n");
+		return false;
+	}
 	return true;
 }
 
-int main(int argc, char* argv[])
+int main(int argc, char *argv[])
 {
-#ifdef _DEBUG	
+#ifdef _DEBUG
 	_CrtSetDbgFlag(_CRTDBG_ALLOC_MEM_DF | _CRTDBG_LEAK_CHECK_DF);
 #endif
 
 	printf("********************************************************************************\r\n");
-	printf("*                    RCKangaroo v3.0  (c) 2024 RetiredCoder                    *\r\n");
+	printf("*                                                                              *\r\n");
+	printf("*                         Kangaroo v%-4s(c) 2025                               *\r\n", gSoftVersion.c_str());
+	printf("*                      Edition by Spectrud POOL MODE                           *\r\n");
+	printf("*                                                                              *\r\n");
 	printf("********************************************************************************\r\n\r\n");
 
-	printf("This software is free and open-source: https://github.com/RetiredC\r\n");
-	printf("It demonstrates fast GPU implementation of SOTA Kangaroo method for solving ECDLP\r\n");
+	// printf("This software is free and open-source: https://github.com/RetiredC\r\n");
+	// printf("It demonstrates fast GPU implementation of SOTA Kangaroo method for solving ECDLP\r\n");
 
 #ifdef _WIN32
 	printf("Windows version\r\n");
@@ -656,8 +903,8 @@ int main(int argc, char* argv[])
 		return 0;
 	}
 
-	pPntList = (u8*)malloc(MAX_CNT_LIST * GPU_DP_SIZE);
-	pPntList2 = (u8*)malloc(MAX_CNT_LIST * GPU_DP_SIZE);
+	pPntList = (u8 *)malloc(MAX_CNT_LIST * GPU_DP_SIZE);
+	pPntList2 = (u8 *)malloc(MAX_CNT_LIST * GPU_DP_SIZE);
 	TotalOps = 0;
 	TotalSolved = 0;
 	gTotalErrors = 0;
@@ -697,17 +944,17 @@ int main(int argc, char* argv[])
 			printf("FATAL ERROR: SolvePoint found incorrect key\r\n");
 			goto label_end;
 		}
-		//happy end
+		// happy end
 		char s[100];
 		pk_found.GetHexStr(s);
 		printf("\r\nPRIVATE KEY: %s\r\n\r\n", s);
-		FILE* fp = fopen("RESULTS.TXT", "a");
+		FILE *fp = fopen("RESULTS.TXT", "a");
 		if (fp)
 		{
 			fprintf(fp, "PRIVATE KEY: %s\n", s);
 			fclose(fp);
 		}
-		else //we cannot save the key, show error and wait forever so the key is displayed
+		else // we cannot save the key, show error and wait forever so the key is displayed
 		{
 			printf("WARNING: Cannot save the key to RESULTS.TXT!\r\n");
 			while (1)
@@ -720,7 +967,7 @@ int main(int argc, char* argv[])
 			printf("\r\nTAMES GENERATION MODE\r\n");
 		else
 			printf("\r\nBENCHMARK MODE\r\n");
-		//solve points, show K
+		// solve points, show K
 		while (1)
 		{
 			EcInt pk, pk_found;
@@ -731,7 +978,7 @@ int main(int argc, char* argv[])
 			if (!gDP)
 				gDP = 16;
 
-			//generate random pk
+			// generate random pk
 			pk.RndBits(gRange);
 			PntToSolve = ec.MultiplyG(pk);
 
@@ -751,7 +998,7 @@ int main(int argc, char* argv[])
 			u64 ops_per_pnt = TotalOps / TotalSolved;
 			double K = (double)ops_per_pnt / pow(2.0, gRange / 2.0);
 			printf("Points solved: %d, average K: %.3f (with DP and GPU overheads)\r\n", TotalSolved, K);
-			//if (TotalSolved >= 100) break; //dbg
+			// if (TotalSolved >= 100) break; //dbg
 		}
 	}
 label_end:
@@ -761,4 +1008,3 @@ label_end:
 	free(pPntList2);
 	free(pPntList);
 }
-
