@@ -3,12 +3,11 @@
 // License: GPLv3, see "LICENSE.TXT" file
 // https://github.com/RetiredC
 
-
 #pragma once
 
 #include "Ec.h"
 
-#define STATS_WND_SIZE	16
+#define STATS_WND_SIZE 16
 
 struct EcJMP
 {
@@ -16,7 +15,7 @@ struct EcJMP
 	EcInt dist;
 };
 
-//96bytes size
+// 96bytes size
 struct TPointPriv
 {
 	u64 x[4];
@@ -42,20 +41,20 @@ class RCGpuKang
 private:
 	bool StopFlag;
 	EcPoint PntToSolve;
-	int Range; //in bits
-	int DP; //in bits
+	int Range; // in bits
+	int DP;	   // in bits
 	Ec ec;
 
-	u32* DPs_out;
+	u32 *DPs_out;
 	TKparams Kparams;
 
 	EcInt HalfRange;
 	EcPoint PntHalfRange;
 	EcPoint NegPntHalfRange;
-	TPointPriv* RndPnts;
-	EcJMP* EcJumps1;
-	EcJMP* EcJumps2;
-	EcJMP* EcJumps3;
+	TPointPriv *RndPnts;
+	EcJMP *EcJumps1;
+	EcJMP *EcJumps2;
+	EcJMP *EcJumps3;
 
 	EcPoint PntA;
 	EcPoint PntB;
@@ -69,6 +68,12 @@ private:
 	u64 startTick;
 	u64 savedUptimeSec;
 
+	char ProgressFileName[1024];
+	u64 lastSaveTick;
+
+	u64 startTick;
+	u64 savedUptimeSec;
+
 	void GenerateRndDistances();
 	bool Start();
 	void Release();
@@ -77,19 +82,22 @@ private:
 #endif
 public:
 	int persistingL2CacheMaxSize;
-	int CudaIndex; //gpu index in cuda
+	int CudaIndex; // gpu index in cuda
 	int mpCnt;
 	int KangCnt;
 	bool Failed;
 	bool IsOldGpu;
 
 	int CalcKangCnt();
-	bool Prepare(EcPoint _PntToSolve, int _Range, int _DP, EcJMP* _EcJumps1, EcJMP* _EcJumps2, EcJMP* _EcJumps3);
+	bool Prepare(EcPoint _PntToSolve, int _Range, int _DP, EcJMP *_EcJumps1, EcJMP *_EcJumps2, EcJMP *_EcJumps3);
 	void Stop();
 	void Execute();
 
 	u32 dbg[256];
 	
+	bool SaveProgress();
+	bool LoadProgress();
+
 	bool SaveProgress();
 	bool LoadProgress();
 
