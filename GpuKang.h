@@ -68,12 +68,6 @@ private:
 	u64 startTick;
 	u64 savedUptimeSec;
 
-	char ProgressFileName[1024];
-	u64 lastSaveTick;
-
-	u64 startTick;
-	u64 savedUptimeSec;
-
 	void GenerateRndDistances();
 	bool Start();
 	void Release();
@@ -95,9 +89,6 @@ public:
 
 	u32 dbg[256];
 	
-	bool SaveProgress();
-	bool LoadProgress();
-
 	bool SaveProgress();
 	bool LoadProgress();
 
