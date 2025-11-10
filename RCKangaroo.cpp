@@ -58,7 +58,7 @@ bool gIsOpsLimit;
 
 bool gSaveCheckpoints = false;
 std::string gClientID;
-std::string gSoftVersion = "3.51";
+std::string gSoftVersion = "3.52";
 int gLastCheckpointDay = -1;
 std::string gRawParams;
 #include <ctime>
@@ -87,6 +87,28 @@ std::string gParamsHash4;
 
 void InitMachineIdHash();
 void InitParamsHash();
+
+static inline uint32_t FNV1a16(const std::string &s)
+{
+	uint32_t h = 2166136261u;
+	for (unsigned char c : s)
+	{
+		h ^= c;
+		h *= 16777619u;
+	}
+	return h & 0xFFFFu;
+}
+
+static inline std::string Norm(std::string v)
+{
+	for (auto &ch : v)
+	{
+		if (ch == '\\')
+			ch = '/';
+		ch = (char)std::tolower((unsigned char)ch);
+	}
+	return v;
+}
 
 //
 
@@ -282,7 +304,7 @@ void AddCheckpointsToList(u8 *pPntList2, int cnt)
 	for (int i = 0; i < cnt; ++i)
 	{
 		u8 *p = pPntList2 + i * GPU_DP_SIZE;
-		char buf[104];
+		char buf[105];
 		for (int j = 0; j < 12; ++j)
 			sprintf(buf + j * 2, "%02x", p[11 - j]);
 		buf[24] = ' ';
@@ -947,56 +969,79 @@ bool ParseCommandLine(int argc, char *argv[])
 	return true;
 }
 
-// void InitMachineIdHash()
-// {
-// 	std::ostringstream oss;
-// 	uint32_t mh = static_cast<uint32_t>(std::hash<std::string>{}(gMachineId) & 0xFFFF);
-// 	oss << std::hex << std::setw(4) << std::setfill('0') << mh;
-// 	gMachineIdHash4 = oss.str();
-// 	// printf("Machine ID: %s\n", gMachineId.c_str());
-// }
-
 void InitMachineIdHash()
 {
 	std::string exePath;
 #ifdef _WIN32
-	char buf[MAX_PATH];
-	DWORD len = GetModuleFileNameA(NULL, buf, MAX_PATH);
-	if (len > 0)
-		exePath.assign(buf, len);
-#else
-	char buf[PATH_MAX];
-	ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
-	if (len > 0)
 	{
-		buf[len] = '\0';
-		exePath.assign(buf);
+		char buf[MAX_PATH];
+		DWORD len = GetModuleFileNameA(NULL, buf, MAX_PATH);
+		if (len > 0)
+			exePath.assign(buf, len);
+	}
+#else
+	{
+		char buf[PATH_MAX];
+		ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+		if (len > 0)
+		{
+			buf[len] = '\0';
+			exePath.assign(buf);
+		}
 	}
 #endif
+	exePath = Norm(exePath);
+	std::string gpuFP;
+	int gcnt = 0;
+	if (cudaGetDeviceCount(&gcnt) == cudaSuccess && gcnt > 0)
+	{
+		for (int i = 0; i < gcnt; ++i)
+		{
+			cudaDeviceProp dp{};
+			if (cudaGetDeviceProperties(&dp, i) != cudaSuccess)
+				continue;
+#if defined(CUDART_VERSION) && (CUDART_VERSION >= 10000)
+			const unsigned char *u = reinterpret_cast<const unsigned char *>(&dp.uuid);
+			char ubuf[33];
+			for (int k = 0; k < 16; ++k)
+				sprintf(ubuf + k * 2, "%02x", u[k]);
+			gpuFP += "|gpu" + std::to_string(i) + "=" + std::string(ubuf, 32);
+#else
+			gpuFP += "|gpu" + std::to_string(i) + "=" + std::string(dp.name) + ":" + std::to_string(dp.pciBusID) + ":" + std::to_string((unsigned long long)dp.totalGlobalMem);
+#endif
+		}
+	}
 
-	// printf("Machine ID: %s\n", gMachineId.c_str());
-	// printf("Exec path: %s\n", exePath.c_str());
-
-	std::string material = gMachineId + "|" + exePath;
+	std::string material = Norm(gMachineId) + "|" + exePath + gpuFP;
+	const uint32_t mh = FNV1a16(material);
 	std::ostringstream oss;
-	uint32_t mh = static_cast<uint32_t>(std::hash<std::string>{}(material) & 0xFFFF);
-	oss << std::hex << std::setw(4) << std::setfill('0') << mh;
+	oss << std::hex << std::nouppercase << std::setw(4) << std::setfill('0') << mh;
 	gMachineIdHash4 = oss.str();
+
+	// DEBUG DUMP (remove after check)
+	{
+		std::string host = Norm(gMachineId);
+		// printf("[MachineHash] host: '%s'\n", host.c_str());
+		// printf("[MachineHash] exePath: '%s'\n", exePath.c_str());
+		// printf("[MachineHash] gpuFP: '%s'\n", gpuFP.c_str());
+		// printf("[MachineHash] material: '%s'\n", material.c_str());
+		// printf("[MachineHash] hash: %s\n", gMachineIdHash4.c_str());
+	}
 }
 
 void InitParamsHash()
 {
-	char hexBufX[65] = {0};
-	char hexBufY[65] = {0};
-	char hexBufStart[129] = {0};
-	gPubKey.x.GetHexStr(hexBufX);
-	gPubKey.y.GetHexStr(hexBufY);
-	gStart.GetHexStr(hexBufStart);
-
-	std::string toHash = std::to_string(gDP) + std::to_string(gRange) + hexBufStart + hexBufX + hexBufY;
-	uint32_t ph = static_cast<uint32_t>(std::hash<std::string>{}(toHash) & 0xFFFF);
+	char hx[65] = {0}, hy[65] = {0}, hs[129] = {0};
+	gPubKey.x.GetHexStr(hx);
+	gPubKey.y.GetHexStr(hy);
+	gStart.GetHexStr(hs);
+	const std::string X = Norm(hx);
+	const std::string Y = Norm(hy);
+	const std::string S = Norm(hs);
+	std::string toHash = "dp=" + std::to_string(gDP) + "|range=" + std::to_string(gRange) + "|start=" + S + "|x=" + X + "|y=" + Y;
+	const uint32_t ph = FNV1a16(toHash);
 	std::ostringstream oss;
-	oss << std::hex << std::setw(4) << std::setfill('0') << ph;
+	oss << std::hex << std::nouppercase << std::setw(4) << std::setfill('0') << ph;
 	gParamsHash4 = oss.str();
 }
 
