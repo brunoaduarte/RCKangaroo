@@ -17,10 +17,12 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <dirent.h>
 #endif
 extern std::string gMachineIdHash4;
 extern std::string gParamsHash4;
 extern int gProgressIntervalSec;
+static char gLastLoadedProgPath[1024] = {0};
 
 u64 RCGpuKang::GetUptimeDays() const
 {
@@ -100,13 +102,14 @@ bool RCGpuKang::Prepare(EcPoint _PntToSolve, int _Range, int _DP, EcJMP *_EcJump
 	Kparams.IsGenMode = gGenMode;
 
 	const std::string gpuId = GpuIdHex(CudaIndex);
+
 	// snprintf(ProgressFileName, sizeof(ProgressFileName),
-	// 		 "PROGRESS/PROGRESS.%s.%s.BIN",
+	// 		 "PROGRESS/PROGRESS.GPU.%s.%s.BIN",
 	// 		 gpuId.c_str(), gParamsHash4.c_str());
 
 	snprintf(ProgressFileName, sizeof(ProgressFileName),
-			 "PROGRESS/PROGRESS.GPU.%s.%s.BIN",
-			 gpuId.c_str(), gParamsHash4.c_str());
+			 "PROGRESS/PROGRESS.GPU%d.%s.%s.BIN",
+			 CudaIndex, gpuId.c_str(), gParamsHash4.c_str());
 
 	lastSaveTick = GetTickCount64();
 	savedUptimeSec = 0;
@@ -436,8 +439,17 @@ bool RCGpuKang::Start()
 		unsigned long long h = (s % 86400ull) / 3600ull;
 		unsigned long long m = (s % 3600ull) / 60ull;
 		unsigned long long sec = s % 60ull;
-		printf("GPU %d: LoadProgress, Uptime %llud:%02lluh:%02llum:%02llus\n",
+		printf("GPU %d: Load progress, Uptime %llud:%02lluh:%02llum:%02llus\n",
 			   CudaIndex, d, h, m, sec);
+
+		const char *p = gLastLoadedProgPath[0] ? gLastLoadedProgPath : ProgressFileName;
+		const char *base = p;
+		for (const char *q = p; *q; ++q)
+		{
+			if (*q == '/' || *q == '\\')
+				base = q + 1;
+		}
+		printf("File: %s\n", base);
 	}
 
 	err = cudaMemset(Kparams.L1S2, 0, mpCnt * Kparams.BlockSize * 8);
@@ -547,15 +559,125 @@ bool RCGpuKang::SaveProgress()
 		unsigned long long h = (s % 86400ull) / 3600ull;
 		unsigned long long m = (s % 3600ull) / 60ull;
 		unsigned long long sec = s % 60ull;
-		printf("GPU %d:  SaveProgress, Uptime %llud:%02lluh:%02llum:%02llus\n",
+		printf("\nGPU %d:  Save progress, Uptime %llud:%02lluh:%02llum:%02llus\n",
 			   CudaIndex, d, h, m, sec);
 	}
 	return success;
 }
 
+// bool RCGpuKang::LoadProgress()
+// {
+// 	FILE *f = fopen(ProgressFileName, "rb");
+// 	if (!f)
+// 		return false;
+// 	ProgressHeader hdr;
+// 	size_t r = fread(&hdr, 1, sizeof(hdr), f);
+// 	if (r != sizeof(hdr))
+// 	{
+// 		fclose(f);
+// 		return false;
+// 	}
+// 	if (memcmp(hdr.magic, "RCKANGPROGv2", 12) != 0 || hdr.version != 2 ||
+// 		hdr.range != (u32)Range || hdr.dp != (u32)DP || hdr.kangCnt != (u32)KangCnt)
+// 	{
+// 		fclose(f);
+// 		return false;
+// 	}
+// 	savedUptimeSec = hdr.uptimeSec;
+// 	size_t bytes = (size_t)hdr.kangCnt * 96;
+// 	u8 *host = (u8 *)malloc(bytes);
+// 	size_t rr = fread(host, 1, bytes, f);
+// 	fclose(f);
+// 	if (rr != bytes)
+// 	{
+// 		free(host);
+// 		return false;
+// 	}
+// 	cudaError_t err = cudaMemcpy(Kparams.Kangs, host, bytes, cudaMemcpyHostToDevice);
+// 	free(host);
+// 	return err == cudaSuccess;
+// }
+
 bool RCGpuKang::LoadProgress()
 {
-	FILE *f = fopen(ProgressFileName, "rb");
+	const std::string gpuId = GpuIdHex(CudaIndex);
+	std::string bestPath;
+	u64 bestUptime = 0;
+#ifdef _WIN32
+	char pattern[1024];
+	snprintf(pattern, sizeof(pattern), "PROGRESS\\PROGRESS.*.%s.%s.BIN", gpuId.c_str(), gParamsHash4.c_str());
+	_finddata_t fdata;
+	auto h = _findfirst(pattern, &fdata);
+	if (h != -1)
+	{
+		do
+		{
+			char path[1200];
+			snprintf(path, sizeof(path), "PROGRESS\\%s", fdata.name);
+			FILE *fp = fopen(path, "rb");
+			if (!fp)
+				continue;
+			ProgressHeader hdr;
+			size_t r = fread(&hdr, 1, sizeof(hdr), fp);
+			fclose(fp);
+			if (r != sizeof(hdr))
+				continue;
+			if (memcmp(hdr.magic, "RCKANGPROGv2", 12) != 0 || hdr.version != 2)
+				continue;
+			if (hdr.uptimeSec >= bestUptime)
+			{
+				bestUptime = hdr.uptimeSec;
+				bestPath = path;
+			}
+		} while (_findnext(h, &fdata) == 0);
+		_findclose(h);
+	}
+#else
+	DIR *dir = opendir("PROGRESS");
+	if (dir)
+	{
+		std::string prefix = "PROGRESS.";
+		std::string suffix = "." + gpuId + "." + gParamsHash4 + ".BIN";
+		struct dirent *de;
+		while ((de = readdir(dir)) != NULL)
+		{
+			const char *name = de->d_name;
+			if (!name || name[0] == '.')
+				continue;
+			std::string fname(name);
+			if (fname.size() <= prefix.size() + suffix.size())
+				continue;
+			if (fname.compare(0, prefix.size(), prefix) != 0)
+				continue;
+			if (fname.compare(fname.size() - suffix.size(), suffix.size(), suffix) != 0)
+				continue;
+			std::string path = std::string("PROGRESS/") + fname;
+			FILE *fp = fopen(path.c_str(), "rb");
+			if (!fp)
+				continue;
+			ProgressHeader hdr;
+			size_t r = fread(&hdr, 1, sizeof(hdr), fp);
+			fclose(fp);
+			if (r != sizeof(hdr))
+				continue;
+			if (memcmp(hdr.magic, "RCKANGPROGv2", 12) != 0 || hdr.version != 2)
+				continue;
+			if (hdr.uptimeSec >= bestUptime)
+			{
+				bestUptime = hdr.uptimeSec;
+				bestPath = path;
+			}
+		}
+		closedir(dir);
+	}
+#endif
+	const char *pathToUse = nullptr;
+	if (!bestPath.empty())
+		pathToUse = bestPath.c_str();
+	else
+		pathToUse = ProgressFileName;
+
+	FILE *f = fopen(pathToUse, "rb");
 	if (!f)
 		return false;
 	ProgressHeader hdr;
@@ -565,14 +687,13 @@ bool RCGpuKang::LoadProgress()
 		fclose(f);
 		return false;
 	}
-	if (memcmp(hdr.magic, "RCKANGPROGv2", 12) != 0 || hdr.version != 2 ||
-		hdr.range != (u32)Range || hdr.dp != (u32)DP || hdr.kangCnt != (u32)KangCnt)
+	if (memcmp(hdr.magic, "RCKANGPROGv2", 12) != 0 || hdr.version != 2)
 	{
 		fclose(f);
 		return false;
 	}
 	savedUptimeSec = hdr.uptimeSec;
-	size_t bytes = (size_t)hdr.kangCnt * 96;
+	size_t bytes = (size_t)KangCnt * 96;
 	u8 *host = (u8 *)malloc(bytes);
 	size_t rr = fread(host, 1, bytes, f);
 	fclose(f);
@@ -583,6 +704,12 @@ bool RCGpuKang::LoadProgress()
 	}
 	cudaError_t err = cudaMemcpy(Kparams.Kangs, host, bytes, cudaMemcpyHostToDevice);
 	free(host);
+
+	if (err == cudaSuccess)
+	{
+		snprintf(gLastLoadedProgPath, sizeof(gLastLoadedProgPath), "%s", pathToUse);
+	}
+
 	return err == cudaSuccess;
 }
 

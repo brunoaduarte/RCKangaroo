@@ -59,7 +59,7 @@ int gProgressIntervalSec;
 
 bool gSaveCheckpoints = false;
 std::string gClientID;
-std::string gSoftVersion = "3.61";
+std::string gSoftVersion = "3.64";
 int gLastCheckpointDay = -1;
 std::string gRawParams;
 #include <ctime>
@@ -355,9 +355,14 @@ void AddCheckpointsToList(u8 *pPntList2, int cnt)
 // {
 // 	time_t now = time(nullptr);
 // 	struct tm *t = localtime(&now);
+
 // 	char datebuf[9];
 // 	snprintf(datebuf, sizeof(datebuf), "%02d-%02d-%02d",
 // 			 t->tm_mday, t->tm_mon + 1, (t->tm_year + 1900) % 100);
+
+// 	// char datebuf[11];
+// 	// snprintf(datebuf, sizeof(datebuf), "%04d-%02d-%02d",
+// 	// 		 t->tm_year + 1900, t->tm_mon + 1, t->tm_mday);
 
 // 	snprintf(gCheckpointFileName, sizeof(gCheckpointFileName),
 // 			 "CHECKPOINTS.%s.%s.%s.%s.TXT",
@@ -371,26 +376,49 @@ void GenerateCheckpointFileName()
 {
 	time_t now = time(nullptr);
 	struct tm *t = localtime(&now);
+
 	char datebuf[9];
 	snprintf(datebuf, sizeof(datebuf), "%02d-%02d-%02d",
 			 t->tm_mday, t->tm_mon + 1, (t->tm_year + 1900) % 100);
-	std::string up = "UP";
-	for (int i = 0; i < GpuCnt; ++i)
+
+	// char datebuf[11];
+	// snprintf(datebuf, sizeof(datebuf), "%04d-%02d-%02d",
+	// 		 t->tm_year + 1900, t->tm_mon + 1, t->tm_mday);
+
+	std::string up;
+	if (GpuCnt > 0)
 	{
-		if (!GpuKangs[i])
-			continue;
-		up += "-";
-		char buf[32];
-		snprintf(buf, sizeof(buf), "%llu", (unsigned long long)GpuKangs[i]->GetUptimeDays());
-		up += buf;
+		unsigned long long sum = 0ULL;
+		int cnt = 0;
+		for (int i = 0; i < GpuCnt; ++i)
+		{
+			if (GpuKangs[i])
+			{
+				sum += (unsigned long long)GpuKangs[i]->GetUptimeDays();
+				++cnt;
+			}
+		}
+		if (cnt > 0)
+		{
+			unsigned long long avg = (sum + (unsigned long long)(cnt / 2)) / (unsigned long long)cnt;
+			up = std::to_string(avg);
+		}
+		else
+		{
+			up = "0";
+		}
+	}
+	else
+	{
+		up = "0";
 	}
 	snprintf(gCheckpointFileName, sizeof(gCheckpointFileName),
 			 "CHECKPOINTS.%s.%s.%s.%s.%s.TXT",
 			 datebuf,
 			 gClientID.c_str(),
 			 gMachineIdHash4.c_str(),
-			 up.c_str(),
-			 gParamsHash4.c_str());
+			 gParamsHash4.c_str(),
+			 up.c_str());
 }
 
 void SaveInitialParamsToFile()
@@ -946,7 +974,7 @@ bool ParseCommandLine(int argc, char *argv[])
 		{
 			int val = atoi(argv[ci]);
 			ci++;
-			if ((val < 10) || (val > 3600))
+			if ((val < 10) || (val > 21600))
 			{
 				printf("error: invalid value for -progress option\r\n");
 				return false;
