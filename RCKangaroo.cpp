@@ -1131,6 +1131,7 @@ bool ParseCommandLine(int argc, char *argv[])
 		}
 		else if (strcmp(argument, "-start") == 0)
 		{
+			if (ci >= argc) { printf("error: missed value after -start option\r\n"); return false; }
 			if (!gStart.SetHexStr(argv[ci]))
 			{
 				printf("error: invalid value for -start option\r\n");
@@ -1216,7 +1217,6 @@ bool ParseCommandLine(int argc, char *argv[])
 			gClientID = id;
 			gSaveCheckpoints = true;
 		}
-
 		else if (strcmp(argument, "-progress") == 0)
 		{
 			int val = atoi(argv[ci]);
