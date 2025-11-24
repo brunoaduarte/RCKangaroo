@@ -59,7 +59,7 @@ int gProgressIntervalSec;
 
 bool gSaveCheckpoints = false;
 std::string gClientID;
-std::string gSoftVersion = "3.64";
+std::string gSoftVersion = "3.65";
 int gLastCheckpointDay = -1;
 std::string gRawParams;
 #include <ctime>
@@ -1038,32 +1038,14 @@ bool ParseCommandLine(int argc, char *argv[])
 
 void InitMachineIdHash()
 {
-	std::string exePath;
-#ifdef _WIN32
-	{
-		char buf[MAX_PATH];
-		DWORD len = GetModuleFileNameA(NULL, buf, MAX_PATH);
-		if (len > 0)
-			exePath.assign(buf, len);
-	}
-#else
-	{
-		char buf[PATH_MAX];
-		ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
-		if (len > 0)
-		{
-			buf[len] = '\0';
-			exePath.assign(buf);
-		}
-	}
-#endif
-	exePath = Norm(exePath);
-	std::string gpuFP;
+	std::string gpuSel;
 	int gcnt = 0;
 	if (cudaGetDeviceCount(&gcnt) == cudaSuccess && gcnt > 0)
 	{
-		for (int i = 0; i < gcnt; ++i)
+		for (int i = 0; i < gcnt && i < MAX_GPU_CNT; ++i)
 		{
+			if (!gGPUs_Mask[i])
+				continue;
 			cudaDeviceProp dp{};
 			if (cudaGetDeviceProperties(&dp, i) != cudaSuccess)
 				continue;
@@ -1072,29 +1054,38 @@ void InitMachineIdHash()
 			char ubuf[33];
 			for (int k = 0; k < 16; ++k)
 				sprintf(ubuf + k * 2, "%02x", u[k]);
-			gpuFP += "|gpu" + std::to_string(i) + "=" + std::string(ubuf, 32);
+			gpuSel += "|gpu" + std::to_string(i) + "=" + std::string(ubuf, 32);
 #else
-			gpuFP += "|gpu" + std::to_string(i) + "=" + std::string(dp.name) + ":" + std::to_string(dp.pciBusID) + ":" + std::to_string((unsigned long long)dp.totalGlobalMem);
+			gpuSel += "|gpu" + std::to_string(i) + "=" + std::string(dp.name) + ":" + std::to_string(dp.pciBusID) + ":" + std::to_string((unsigned long long)dp.totalGlobalMem);
 #endif
 		}
 	}
-
-	// std::string material = Norm(gMachineId) + "|" + exePath + gpuFP;
-	std::string material = Norm(gMachineId) + "|" + gpuFP;
+	std::string material = Norm(gMachineId) + "|" + gpuSel;
 	const uint32_t mh = FNV1a16(material);
 	std::ostringstream oss;
 	oss << std::hex << std::nouppercase << std::setw(4) << std::setfill('0') << mh;
 	gMachineIdHash4 = oss.str();
 
-	// DEBUG DUMP (remove after check)
-	{
-		// std::string host = Norm(gMachineId);
-		// printf("[MachineHash] host: '%s'\n", host.c_str());
-		// printf("[MachineHash] exePath: '%s'\n", exePath.c_str());
-		// printf("[MachineHash] gpuFP: '%s'\n", gpuFP.c_str());
-		// printf("[MachineHash] material: '%s'\n", material.c_str());
-		// printf("[MachineHash] hash: %s\n", gMachineIdHash4.c_str());
-	}
+	// // DEBUG DUMP
+	// {
+	// 	std::string host = Norm(gMachineId);
+	// 	std::string selIdx;
+	// 	for (int i = 0; i < MAX_GPU_CNT; ++i)
+	// 	{
+	// 		if (gGPUs_Mask[i])
+	// 		{
+	// 			if (!selIdx.empty())
+	// 				selIdx.push_back(',');
+	// 			selIdx += std::to_string(i);
+	// 		}
+	// 	}
+	// 	printf("[MachineHash] host: '%s'\n", host.c_str());
+	// 	printf("[MachineHash] selGPUs: '%s'\n", selIdx.empty() ? "(none)" : selIdx.c_str());
+	// 	printf("[MachineHash] gpuFP: '%s'\n", gpuSel.c_str());
+	// 	printf("[MachineHash] material: '%s'\n", material.c_str());
+	// 	printf("[MachineHash] hash: %s\n", gMachineIdHash4.c_str());
+	// }
+	// // END DEBUG DUMP
 }
 
 void InitParamsHash()
