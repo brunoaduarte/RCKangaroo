@@ -19,6 +19,8 @@
 #include "utils.h"
 #include "GpuKang.h"
 
+bool parse_u8(const char *s, u8 *res);
+
 EcJMP EcJumps1[JMP_CNT];
 EcJMP EcJumps2[JMP_CNT];
 EcJMP EcJumps3[JMP_CNT];
@@ -62,6 +64,8 @@ bool gIsOpsLimit;
 int gProgressIntervalSec;
 
 bool gSaveCheckpoints = false;
+bool gSaveBinaryCheckpoints = false;
+bool gSaveCheckpointText = true;
 std::string gClientID;
 std::string gSoftVersion = "3.65-autosend";
 int gLastCheckpointDay = -1;
@@ -85,8 +89,11 @@ std::string gRawParams;
 #endif
 
 char gCheckpointFileName[1024] = {0};
+char gCheckpointBinFileName[1024] = {0};
 static std::vector<std::string> gPoolCheckpoints;
+static std::vector<std::vector<uint8_t>> gPoolCheckpointsBin;
 static size_t gSavedLines = 0;
+static size_t gSavedBinaryRecords = 0;
 std::string gMachineId;
 std::string gMachineIdHash4;
 std::string gParamsHash4;
@@ -502,20 +509,27 @@ bool Collision_SOTA(EcPoint &pnt, EcInt t, int TameType, EcInt w, int WildType, 
 
 void AddCheckpointsToList(u8 *pPntList2, int cnt)
 {
-	csCheckpoints.Enter();
-	gPoolCheckpoints.reserve(gPoolCheckpoints.size() + cnt);
-	for (int i = 0; i < cnt; ++i)
-	{
-		u8 *p = pPntList2 + i * GPU_DP_SIZE;
-		char buf[105];
-		for (int j = 0; j < 12; ++j)
-			sprintf(buf + j * 2, "%02x", p[11 - j]);
-		buf[24] = ' ';
-		u8 d[24];
-		for (int j = 0; j < 24; ++j)
-			d[j] = p[16 + j];
-		if ((d[23] & 0xF0) == 0xF0)
-		{
+        csCheckpoints.Enter();
+        if (gSaveCheckpointText)
+                gPoolCheckpoints.reserve(gPoolCheckpoints.size() + cnt);
+        if (gSaveBinaryCheckpoints)
+                gPoolCheckpointsBin.reserve(gPoolCheckpointsBin.size() + cnt);
+        for (int i = 0; i < cnt; ++i)
+        {
+                u8 *p = pPntList2 + i * GPU_DP_SIZE;
+                char buf[105];
+                u8 xbuf[12];
+                for (int j = 0; j < 12; ++j)
+                {
+                        sprintf(buf + j * 2, "%02x", p[11 - j]);
+                        xbuf[j] = p[11 - j];
+                }
+                buf[24] = ' ';
+                u8 d[24];
+                for (int j = 0; j < 24; ++j)
+                        d[j] = p[16 + j];
+                if ((d[23] & 0xF0) == 0xF0)
+                {
 			u8 result[24];
 			int borrow = 0;
 			for (int k = 0; k < 24; ++k)
@@ -538,25 +552,39 @@ void AddCheckpointsToList(u8 *pPntList2, int cnt)
 				int sum = result[k] + borrow;
 				result[k] = sum & 0xFF;
 				borrow = (sum > 0xFF) ? 1 : 0;
-			}
-			for (int k = 0; k < 24; ++k)
-				d[k] = result[k];
-		}
-		for (int j = 0; j < 8; ++j)
-			sprintf(buf + 25 + j * 2, "00");
-		for (int j = 0; j < 24; ++j)
-			sprintf(buf + 41 + j * 2, "%02x", d[23 - j]);
-		int type = gGenMode ? TAME : p[40];
-		snprintf(buf + 25 + 64, 16, " TYPE:%d", type);
-		gPoolCheckpoints.emplace_back(buf);
-	}
-	csCheckpoints.Leave();
+                        }
+                        for (int k = 0; k < 24; ++k)
+                                d[k] = result[k];
+                }
+                int type = gGenMode ? TAME : p[40];
+                if (gSaveCheckpointText)
+                {
+                        for (int j = 0; j < 8; ++j)
+                                sprintf(buf + 25 + j * 2, "00");
+                        for (int j = 0; j < 24; ++j)
+                                sprintf(buf + 41 + j * 2, "%02x", d[23 - j]);
+                        snprintf(buf + 25 + 64, 16, " TYPE:%d", type);
+                        gPoolCheckpoints.emplace_back(buf);
+                }
+                if (gSaveBinaryCheckpoints)
+                {
+                        std::vector<uint8_t> rec;
+                        rec.reserve(45);
+                        rec.insert(rec.end(), xbuf, xbuf + 12);
+                        rec.insert(rec.end(), 8, 0);
+                        for (int j = 0; j < 24; ++j)
+                                rec.push_back(d[23 - j]);
+                        rec.push_back((uint8_t)type);
+                        gPoolCheckpointsBin.emplace_back(std::move(rec));
+                }
+        }
+        csCheckpoints.Leave();
 }
 
 void GenerateCheckpointFileName()
 {
-	time_t now = time(nullptr);
-	struct tm *t = localtime(&now);
+        time_t now = time(nullptr);
+        struct tm *t = localtime(&now);
 
 	char datebuf[12]; // enough for "dd-mm-yy" + NUL
 	if (strftime(datebuf, sizeof(datebuf), "%d-%m-%y", t) == 0) {
@@ -589,54 +617,145 @@ void GenerateCheckpointFileName()
 	}
 	else
 	{
-		up = "0";
-	}
-	snprintf(gCheckpointFileName, sizeof(gCheckpointFileName),
-			 "CHECKPOINTS.%s.%s.%s.%s.%s.TXT",
-			 datebuf,
-			 gClientID.c_str(),
-			 gMachineIdHash4.c_str(),
-			 gParamsHash4.c_str(),
-			 up.c_str());
+                up = "0";
+        }
+        snprintf(gCheckpointFileName, sizeof(gCheckpointFileName),
+                         "CHECKPOINTS.%s.%s.%s.%s.%s.TXT",
+                         datebuf,
+                         gClientID.c_str(),
+                         gMachineIdHash4.c_str(),
+                         gParamsHash4.c_str(),
+                         up.c_str());
+        if (gSaveBinaryCheckpoints)
+        {
+                snprintf(gCheckpointBinFileName, sizeof(gCheckpointBinFileName),
+                                 "CHECKPOINTS.%s.%s.%s.%s.%s.BIN",
+                                 datebuf,
+                                 gClientID.c_str(),
+                                 gMachineIdHash4.c_str(),
+                                 gParamsHash4.c_str(),
+                                 up.c_str());
+        }
+        else
+        {
+                gCheckpointBinFileName[0] = 0;
+        }
 }
 
 void SaveInitialParamsToFile()
 {
-	std::ifstream check(gCheckpointFileName);
-	if (check.good())
-		return;
-	FILE *f = fopen(gCheckpointFileName, "a");
-	if (f)
-	{
-		bool wrote = fprintf(f, "%s\n", gRawParams.c_str()) >= 0;
-		int ok = fflush(f);
+        std::ifstream check(gCheckpointFileName);
+        if (check.good())
+                return;
+        FILE *f = fopen(gCheckpointFileName, "a");
+        if (f)
+        {
+                bool wrote = fprintf(f, "%s\n", gRawParams.c_str()) >= 0;
+                int ok = fflush(f);
 #ifdef _WIN32
-		if (ok == 0)
-			ok = _commit(_fileno(f));
+                if (ok == 0)
+                        ok = _commit(_fileno(f));
 #else
-		if (ok == 0)
-			ok = fsync(fileno(f));
+                if (ok == 0)
+                        ok = fsync(fileno(f));
 #endif
-		fclose(f);
+                fclose(f);
 
-		if (wrote && ok == 0)
-		{
-			csCheckpoints.Enter();
-			QueueRemoteBatch(gCheckpointFileName, std::vector<std::string>{gRawParams});
-			TryFlushRemoteQueue();
-			csCheckpoints.Leave();
-		}
-	}
-	else
-	{
-		printf("Error: cannot create initial checkpoint file.\n");
-	}
+                if (wrote && ok == 0)
+                {
+                        csCheckpoints.Enter();
+                        QueueRemoteBatch(gCheckpointFileName, std::vector<std::string>{gRawParams});
+                        TryFlushRemoteQueue();
+                        csCheckpoints.Leave();
+                }
+        }
+        else
+        {
+                printf("Error: cannot create initial checkpoint file.\n");
+        }
+}
+
+static bool HexStrToBytes(const char *hex, size_t hexLen, std::vector<uint8_t> &out)
+{
+        if (hexLen % 2 != 0)
+                return false;
+        out.clear();
+        out.reserve(hexLen / 2);
+        for (size_t i = 0; i < hexLen; i += 2)
+        {
+                u8 b;
+                if (!parse_u8(hex + i, &b))
+                        return false;
+                out.push_back(b);
+        }
+        return true;
+}
+
+void SaveInitialParamsToBinaryFile()
+{
+        if (!gSaveBinaryCheckpoints)
+                return;
+
+        std::ifstream check(gCheckpointBinFileName, std::ios::binary);
+        if (check.good())
+                return;
+
+        std::vector<uint8_t> header;
+        header.reserve(99);
+
+        char startHex[65] = {0};
+        gStart.GetHexStr(startHex);
+        std::vector<uint8_t> startBytes;
+        if (!HexStrToBytes(startHex, 64, startBytes))
+        {
+                printf("Error: cannot serialize start offset to binary checkpoint.\n");
+                return;
+        }
+        header.insert(header.end(), startBytes.begin(), startBytes.end());
+
+        header.push_back(static_cast<uint8_t>(gDP & 0xFF));
+        header.push_back(static_cast<uint8_t>(gRange & 0xFF));
+
+        std::vector<uint8_t> pubkey;
+        pubkey.reserve(33);
+        const uint8_t prefix = (((u8 *)gPubKey.y.data)[0] & 1) ? 0x03 : 0x02;
+        pubkey.push_back(prefix);
+        for (int i = 0; i < 32; ++i)
+                pubkey.push_back(((u8 *)gPubKey.x.data)[31 - i]);
+        header.insert(header.end(), pubkey.begin(), pubkey.end());
+
+        header.insert(header.end(), 32, 0x55);
+
+        FILE *f = fopen(gCheckpointBinFileName, "ab");
+        if (f)
+        {
+                size_t w = fwrite(header.data(), 1, header.size(), f);
+                int ok = fflush(f);
+#ifdef _WIN32
+                if (ok == 0)
+                        ok = _commit(_fileno(f));
+#else
+                if (ok == 0)
+                        ok = fsync(fileno(f));
+#endif
+                fclose(f);
+
+                if (w != header.size() || ok != 0)
+                        printf("Error: cannot create initial binary checkpoint file.\n");
+        }
+        else
+        {
+                printf("Error: cannot create initial binary checkpoint file.\n");
+        }
 }
 
 void SaveCheckpointToFile()
 {
-	csCheckpoints.Enter();
-	TryFlushRemoteQueue();
+        if (!gSaveCheckpointText)
+                return;
+
+        csCheckpoints.Enter();
+        TryFlushRemoteQueue();
 
 	size_t total = gPoolCheckpoints.size();
 	if (gSavedLines >= total)
@@ -705,7 +824,68 @@ void SaveCheckpointToFile()
 	if (ok == 0 && !writtenLines.empty())
 		TryFlushRemoteQueue();
 
-	csCheckpoints.Leave();
+        csCheckpoints.Leave();
+}
+
+void SaveCheckpointBinaryToFile()
+{
+        if (!gSaveBinaryCheckpoints)
+                return;
+
+        csCheckpoints.Enter();
+
+        size_t total = gPoolCheckpointsBin.size();
+        if (gSavedBinaryRecords >= total)
+        {
+                csCheckpoints.Leave();
+                return;
+        }
+
+        FILE *f = fopen(gCheckpointBinFileName, "ab");
+        if (!f)
+        {
+                csCheckpoints.Leave();
+                printf("Error: cannot open binary checkpoint file for appending.\n");
+                return;
+        }
+
+        const size_t oldSaved = gSavedBinaryRecords;
+        size_t i = gSavedBinaryRecords;
+
+        for (; i < total; ++i)
+        {
+                const std::vector<uint8_t> &rec = gPoolCheckpointsBin[i];
+                size_t w = fwrite(rec.data(), 1, rec.size(), f);
+                if (w != rec.size())
+                        break;
+        }
+
+        int ok = fflush(f);
+#ifdef _WIN32
+        if (ok == 0)
+                ok = _commit(_fileno(f));
+#else
+        if (ok == 0)
+                ok = fsync(fileno(f));
+#endif
+        fclose(f);
+
+        if (ok == 0 && i == total)
+        {
+                gSavedBinaryRecords = 0;
+                gPoolCheckpointsBin.clear();
+                gPoolCheckpointsBin.shrink_to_fit();
+        }
+        else
+        {
+                gSavedBinaryRecords = i;
+                if (i == oldSaved)
+                        printf("Error: failed to write binary checkpoint records to file.\n");
+                else
+                        printf("Warning: partial binary write (%zu/%zu new records).\n", i - oldSaved, total - oldSaved);
+        }
+
+        csCheckpoints.Leave();
 }
 
 void CheckNewPoints()
@@ -823,22 +1003,28 @@ void ShowStats(u64 tm_start, double exp_ops, double dp_val)
 	}
 #endif
 
-	if (gSaveCheckpoints)
-	{
-		time_t now = time(nullptr);
-		struct tm *tmNow = localtime(&now);
-		int day = tmNow->tm_mday;
-		if (day != gLastCheckpointDay)
-		{
-			gLastCheckpointDay = day;
-			GenerateCheckpointFileName();
-			SaveInitialParamsToFile();
-		}
-	}
-	if (gSaveCheckpoints)
-	{
-		SaveCheckpointToFile();
-	}
+        if (gSaveCheckpoints)
+        {
+                time_t now = time(nullptr);
+                struct tm *tmNow = localtime(&now);
+                int day = tmNow->tm_mday;
+                if (day != gLastCheckpointDay)
+                {
+                        gLastCheckpointDay = day;
+                        GenerateCheckpointFileName();
+                        gSavedLines = 0;
+                        gSavedBinaryRecords = 0;
+                        if (gSaveCheckpointText)
+                                SaveInitialParamsToFile();
+                        if (gSaveBinaryCheckpoints)
+                                SaveInitialParamsToBinaryFile();
+                }
+        }
+        if (gSaveCheckpoints)
+        {
+                SaveCheckpointToFile();
+                SaveCheckpointBinaryToFile();
+        }
 
 	int speed = GpuKangs[0]->GetStatsSpeed();
 	for (int i = 1; i < GpuCnt; i++)
@@ -1167,25 +1353,36 @@ bool ParseCommandLine(int argc, char *argv[])
 			gMax = val;
 		}
 
-		else if (strcmp(argument, "--pool-address") == 0)
-		{
-			if (ci >= argc)
-			{
-				printf("error: missing value after --pool-address option\n");
+                else if (strcmp(argument, "--pool-address") == 0)
+                {
+                        if (ci >= argc)
+                        {
+                                printf("error: missing value after --pool-address option\n");
 				return false;
 			}
-			gPoolAddress = argv[ci++];
-			if (gPoolAddress.rfind("https://", 0) != 0)
-			{
-				printf("error: pool address must start with https://\n");
-				return false;
-			}
-		}
+                        gPoolAddress = argv[ci++];
+                        if (gPoolAddress.rfind("https://", 0) != 0)
+                        {
+                                printf("error: pool address must start with https://\n");
+                                return false;
+                        }
+                }
 
-		else if (strcmp(argument, "-nodeID") == 0)
-		{
-			if (ci >= argc)
-			{
+                else if (strcmp(argument, "--bin-checkpoints") == 0)
+                {
+                        gSaveBinaryCheckpoints = true;
+                }
+
+                else if (strcmp(argument, "--bin-checkpoints-only") == 0)
+                {
+                        gSaveBinaryCheckpoints = true;
+                        gSaveCheckpointText = false;
+                }
+
+                else if (strcmp(argument, "-nodeID") == 0)
+                {
+                        if (ci >= argc)
+                        {
 				printf("error: missing value after -nodeID option\n");
 				return false;
 			}
@@ -1212,9 +1409,9 @@ bool ParseCommandLine(int argc, char *argv[])
 				}
 			}
 
-			gClientID = id;
-			gSaveCheckpoints = true;
-		}
+                        gClientID = id;
+                        gSaveCheckpoints = true;
+                }
 		else if (strcmp(argument, "-progress") == 0)
 		{
 			int val = atoi(argv[ci]);
@@ -1231,12 +1428,18 @@ bool ParseCommandLine(int argc, char *argv[])
 		{
 			printf("error: unknown option %s\r\n", argument);
 			return false;
-		}
-	}
+                }
+        }
 
-	if (gSaveCheckpoints)
-	{
-		printf("Checkpoint saving mode is enabled.\n");
+        if (gSaveBinaryCheckpoints && !gSaveCheckpoints)
+        {
+                printf("error: binary checkpoint options require checkpoint saving mode (-nodeID)\n");
+                return false;
+        }
+
+        if (gSaveCheckpoints)
+        {
+                printf("Checkpoint saving mode is enabled.\n");
 		gRawParams.clear();
 		for (int i = 1; i < argc; ++i)
 		{
