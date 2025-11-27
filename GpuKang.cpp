@@ -5,8 +5,10 @@
 
 
 #include <iostream>
+#include <limits>
 #include "cuda_runtime.h"
 #include "cuda.h"
+#include "cublas_v2.h"
 
 #include "GpuKang.h"
 
@@ -15,6 +17,49 @@ void CallGpuKernelGen(TKparams Kparams);
 void CallGpuKernelABC(TKparams Kparams);
 void AddPointsToList(u32* data, int cnt, u64 ops_cnt);
 extern bool gGenMode; //tames generation mode
+
+namespace
+{
+const char* CuBlasStatusToString(cublasStatus_t status)
+{
+        switch (status)
+        {
+        case CUBLAS_STATUS_SUCCESS: return "SUCCESS";
+        case CUBLAS_STATUS_NOT_INITIALIZED: return "NOT_INITIALIZED";
+        case CUBLAS_STATUS_ALLOC_FAILED: return "ALLOC_FAILED";
+        case CUBLAS_STATUS_INVALID_VALUE: return "INVALID_VALUE";
+        case CUBLAS_STATUS_ARCH_MISMATCH: return "ARCH_MISMATCH";
+        case CUBLAS_STATUS_MAPPING_ERROR: return "MAPPING_ERROR";
+        case CUBLAS_STATUS_EXECUTION_FAILED: return "EXECUTION_FAILED";
+        case CUBLAS_STATUS_INTERNAL_ERROR: return "INTERNAL_ERROR";
+        case CUBLAS_STATUS_NOT_SUPPORTED: return "NOT_SUPPORTED";
+        case CUBLAS_STATUS_LICENSE_ERROR: return "LICENSE_ERROR";
+        default: return "UNKNOWN";
+        }
+}
+
+bool CopyWithCublas(cublasHandle_t handle, int cudaIndex, const void* src, void* dst, size_t bytes, const char* label)
+{
+        if (!handle)
+        {
+                printf("GPU %d, cublas handle not initialized for %s\n", cudaIndex, label);
+                return false;
+        }
+        if (bytes > static_cast<size_t>(std::numeric_limits<int>::max()))
+        {
+                printf("GPU %d, cublasSetVector for %s failed: buffer too large (%zu bytes)\n", cudaIndex, label, bytes);
+                return false;
+        }
+
+        cublasStatus_t status = cublasSetVector(static_cast<int>(bytes), sizeof(u8), src, 1, dst, 1);
+        if (status != CUBLAS_STATUS_SUCCESS)
+        {
+                printf("GPU %d, cublasSetVector for %s failed: %s\n", cudaIndex, label, CuBlasStatusToString(status));
+                return false;
+        }
+        return true;
+}
+}
 
 int RCGpuKang::CalcKangCnt()
 {
@@ -27,23 +72,42 @@ int RCGpuKang::CalcKangCnt()
 //executes in main thread
 bool RCGpuKang::Prepare(EcPoint _PntToSolve, int _Range, int _DP, EcJMP* _EcJumps1, EcJMP* _EcJumps2, EcJMP* _EcJumps3)
 {
-	PntToSolve = _PntToSolve;
-	Range = _Range;
-	DP = _DP;
+        PntToSolve = _PntToSolve;
+        Range = _Range;
+        DP = _DP;
 	EcJumps1 = _EcJumps1;
 	EcJumps2 = _EcJumps2;
 	EcJumps3 = _EcJumps3;
-	StopFlag = false;
-	Failed = false;
-	u64 total_mem = 0;
-	memset(dbg, 0, sizeof(dbg));
-	memset(SpeedStats, 0, sizeof(SpeedStats));
-	cur_stats_ind = 0;
+        StopFlag = false;
+        Failed = false;
+        u64 total_mem = 0;
+        memset(dbg, 0, sizeof(dbg));
+        memset(SpeedStats, 0, sizeof(SpeedStats));
+        cur_stats_ind = 0;
+        cublasHandle = nullptr;
+        cublasReady = false;
 
 	cudaError_t err;
-	err = cudaSetDevice(CudaIndex);
-	if (err != cudaSuccess)
-		return false;
+        err = cudaSetDevice(CudaIndex);
+        if (err != cudaSuccess)
+                return false;
+
+        cublasStatus_t cublasStatus = cublasCreate(&cublasHandle);
+        if (cublasStatus != CUBLAS_STATUS_SUCCESS)
+        {
+                printf("GPU %d, cublasCreate failed: %s\n", CudaIndex, CuBlasStatusToString(cublasStatus));
+                return false;
+        }
+        cublasReady = true;
+
+        auto cleanupCublas = [this]()
+        {
+                if (cublasReady)
+                {
+                        cublasDestroy(cublasHandle);
+                        cublasReady = false;
+                }
+        };
 
 	Kparams.BlockCnt = mpCnt;
 	Kparams.BlockSize = IsOldGpu ? BLOCK_SIZE_OLD_GPU : BLOCK_SIZE_NEW_GPU;
@@ -201,15 +265,14 @@ bool RCGpuKang::Prepare(EcPoint _PntToSolve, int _Range, int _DP, EcJMP* _EcJump
 		memcpy(buf + i * 12 + 4, EcJumps1[i].p.y.data, 32);
 		memcpy(buf + i * 12 + 8, EcJumps1[i].dist.data, 32);
 	}
-	err = cudaMemcpy(Kparams.Jumps1, buf, JMP_CNT * 96, cudaMemcpyHostToDevice);
-	if (err != cudaSuccess)
-	{
-		printf("GPU %d, cudaMemcpy Jumps1 failed: %s\n", CudaIndex, cudaGetErrorString(err));
-		return false;
-	}
-	free(buf);
+        if (!CopyWithCublas(cublasHandle, CudaIndex, buf, Kparams.Jumps1, JMP_CNT * 96, "Jumps1"))
+        {
+                cleanupCublas();
+                return false;
+        }
+        free(buf);
 //jmp2
-	buf = (u64*)malloc(JMP_CNT * 96);
+        buf = (u64*)malloc(JMP_CNT * 96);
 	u64* jmp2_table = (u64*)malloc(JMP_CNT * 64);
 	for (int i = 0; i < JMP_CNT; i++)
 	{
@@ -219,13 +282,12 @@ bool RCGpuKang::Prepare(EcPoint _PntToSolve, int _Range, int _DP, EcJMP* _EcJump
 		memcpy(jmp2_table + i * 8 + 4, EcJumps2[i].p.y.data, 32);
 		memcpy(buf + i * 12 + 8, EcJumps2[i].dist.data, 32);
 	}
-	err = cudaMemcpy(Kparams.Jumps2, buf, JMP_CNT * 96, cudaMemcpyHostToDevice);
-	if (err != cudaSuccess)
-	{
-		printf("GPU %d, cudaMemcpy Jumps2 failed: %s\n", CudaIndex, cudaGetErrorString(err));
-		return false;
-	}
-	free(buf);
+        if (!CopyWithCublas(cublasHandle, CudaIndex, buf, Kparams.Jumps2, JMP_CNT * 96, "Jumps2"))
+        {
+                cleanupCublas();
+                return false;
+        }
+        free(buf);
 
 	err = cuSetGpuParams(Kparams, jmp2_table);
 	if (err != cudaSuccess)
@@ -243,13 +305,12 @@ bool RCGpuKang::Prepare(EcPoint _PntToSolve, int _Range, int _DP, EcJMP* _EcJump
 		memcpy(buf + i * 12 + 4, EcJumps3[i].p.y.data, 32);
 		memcpy(buf + i * 12 + 8, EcJumps3[i].dist.data, 32);
 	}
-	err = cudaMemcpy(Kparams.Jumps3, buf, JMP_CNT * 96, cudaMemcpyHostToDevice);
-	if (err != cudaSuccess)
-	{
-		printf("GPU %d, cudaMemcpy Jumps3 failed: %s\n", CudaIndex, cudaGetErrorString(err));
-		return false;
-	}
-	free(buf);
+        if (!CopyWithCublas(cublasHandle, CudaIndex, buf, Kparams.Jumps3, JMP_CNT * 96, "Jumps3"))
+        {
+                cleanupCublas();
+                return false;
+        }
+        free(buf);
 
 	printf("GPU %d: allocated %llu MB, %d kangaroos. OldGpuMode: %s\r\n", CudaIndex, total_mem / (1024 * 1024), KangCnt, IsOldGpu ? "Yes" : "No");
 	return true;
@@ -257,9 +318,9 @@ bool RCGpuKang::Prepare(EcPoint _PntToSolve, int _Range, int _DP, EcJMP* _EcJump
 
 void RCGpuKang::Release()
 {
-	free(RndPnts);
-	free(DPs_out);
-	cudaFree(Kparams.LoopedKangs);
+        free(RndPnts);
+        free(DPs_out);
+        cudaFree(Kparams.LoopedKangs);
 	cudaFree(Kparams.dbg_buf);
 	cudaFree(Kparams.LoopTable);
 	cudaFree(Kparams.LastPnts);
@@ -267,12 +328,18 @@ void RCGpuKang::Release()
 	cudaFree(Kparams.DPTable);
 	cudaFree(Kparams.JumpsList);
 	cudaFree(Kparams.Jumps3);
-	cudaFree(Kparams.Jumps2);
-	cudaFree(Kparams.Jumps1);
-	cudaFree(Kparams.Kangs);
-	cudaFree(Kparams.DPs_out);
-	if (!IsOldGpu)
-		cudaFree(Kparams.L2);
+        cudaFree(Kparams.Jumps2);
+        cudaFree(Kparams.Jumps1);
+        cudaFree(Kparams.Kangs);
+        cudaFree(Kparams.DPs_out);
+        if (!IsOldGpu)
+                cudaFree(Kparams.L2);
+
+        if (cublasReady)
+        {
+                cublasDestroy(cublasHandle);
+                cublasReady = false;
+        }
 }
 
 void RCGpuKang::Stop()
@@ -345,15 +412,13 @@ bool RCGpuKang::Start()
 		p.SaveToBuffer64((u8*)RndPnts[i].x);
 	}
 	//copy to gpu
-	err = cudaMemcpy(Kparams.Kangs, RndPnts, KangCnt * 96, cudaMemcpyHostToDevice);
-	if (err != cudaSuccess)
-	{
-		printf("GPU %d, cudaMemcpy failed: %s\n", CudaIndex, cudaGetErrorString(err));
-		return false;
-	}
+        if (!CopyWithCublas(cublasHandle, CudaIndex, RndPnts, Kparams.Kangs, KangCnt * 96, "Kangs initial copy"))
+        {
+                return false;
+        }
 /**/
-	//but it's faster to calc them on GPU
-	u8 buf_PntA[64], buf_PntB[64];
+        //but it's faster to calc them on GPU
+        u8 buf_PntA[64], buf_PntB[64];
 	PntA.SaveToBuffer64(buf_PntA);
 	PntB.SaveToBuffer64(buf_PntB);
 	for (int i = 0; i < KangCnt; i++)
@@ -367,12 +432,10 @@ bool RCGpuKang::Start()
 				memcpy(RndPnts[i].x, buf_PntB, 64);
 	}
 	//copy to gpu
-	err = cudaMemcpy(Kparams.Kangs, RndPnts, KangCnt * 96, cudaMemcpyHostToDevice);
-	if (err != cudaSuccess)
-	{
-		printf("GPU %d, cudaMemcpy failed: %s\n", CudaIndex, cudaGetErrorString(err));
-		return false;
-	}
+        if (!CopyWithCublas(cublasHandle, CudaIndex, RndPnts, Kparams.Kangs, KangCnt * 96, "Kangs seed"))
+        {
+                return false;
+        }
 	CallGpuKernelGen(Kparams);
 
 	err = cudaMemset(Kparams.L1S2, 0, mpCnt * Kparams.BlockSize * 8);

@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include <cublas_v2.h>
+
 #include "Ec.h"
 
 #define STATS_WND_SIZE	16
@@ -40,9 +42,12 @@ private:
 	EcPoint PntHalfRange;
 	EcPoint NegPntHalfRange;
 	TPointPriv* RndPnts;
-	EcJMP* EcJumps1;
-	EcJMP* EcJumps2;
-	EcJMP* EcJumps3;
+        EcJMP* EcJumps1;
+        EcJMP* EcJumps2;
+        EcJMP* EcJumps3;
+
+        cublasHandle_t cublasHandle = nullptr;
+        bool cublasReady = false;
 
 	EcPoint PntA;
 	EcPoint PntB;
