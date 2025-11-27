@@ -63,7 +63,7 @@ int gProgressIntervalSec;
 
 bool gSaveCheckpoints = false;
 std::string gClientID;
-std::string gSoftVersion = "3.65-autosend";
+std::string gSoftVersion = "3.7-autosend";
 int gLastCheckpointDay = -1;
 std::string gRawParams;
 #include <ctime>
@@ -542,12 +542,16 @@ void AddCheckpointsToList(u8 *pPntList2, int cnt)
 			for (int k = 0; k < 24; ++k)
 				d[k] = result[k];
 		}
-		for (int j = 0; j < 8; ++j)
-			sprintf(buf + 25 + j * 2, "00");
-		for (int j = 0; j < 24; ++j)
-			sprintf(buf + 41 + j * 2, "%02x", d[23 - j]);
+		int first = 23;
+		while (first > 0 && d[first] == 0)
+			--first;
+		int num_bytes = first + 1;
+		int hex_pos = 25;
+		for (int j = 0; j < num_bytes; ++j)
+			sprintf(buf + hex_pos + j * 2, "%02x", d[first - j]);
 		int type = gGenMode ? TAME : p[40];
-		snprintf(buf + 25 + 64, 16, " TYPE:%d", type);
+		int pos = hex_pos + num_bytes * 2;
+		snprintf(buf + pos, 16, " %d", type);
 		gPoolCheckpoints.emplace_back(buf);
 	}
 	csCheckpoints.Leave();
@@ -605,7 +609,7 @@ void SaveInitialParamsToFile()
 	std::ifstream check(gCheckpointFileName);
 	if (check.good())
 		return;
-	FILE *f = fopen(gCheckpointFileName, "a");
+	FILE *f = fopen(gCheckpointFileName, "ab");
 	if (f)
 	{
 		bool wrote = fprintf(f, "%s\n", gRawParams.c_str()) >= 0;
@@ -645,7 +649,7 @@ void SaveCheckpointToFile()
 		return;
 	}
 
-	FILE *f = fopen(gCheckpointFileName, "a");
+	FILE *f = fopen(gCheckpointFileName, "ab");
 	if (!f)
 	{
 		csCheckpoints.Leave();
@@ -1182,24 +1186,24 @@ bool ParseCommandLine(int argc, char *argv[])
 			}
 		}
 
-		else if (strcmp(argument, "-nodeID") == 0)
+		else if (strcmp(argument, "-checkpoints") == 0)
 		{
 			if (ci >= argc)
 			{
-				printf("error: missing value after -nodeID option\n");
+				printf("error: missing value after -checkpoints option\n");
 				return false;
 			}
 			std::string id = argv[ci++];
 
 			if (id.empty() || id[0] != '@')
 			{
-				printf("error: nodeID must start with '@' (example: @Worker)\n");
+				printf("error: checkpoints must start with '@' (example: @Name)\n");
 				return false;
 			}
 
 			if (id.length() > 20)
 			{
-				printf("error: nodeID length must not exceed 20 characters\n");
+				printf("error: checkpoints length must not exceed 20 characters\n");
 				return false;
 			}
 
@@ -1207,7 +1211,7 @@ bool ParseCommandLine(int argc, char *argv[])
 			{
 				if (!std::isalnum(static_cast<unsigned char>(id[i])) && id[i] != '_')
 				{
-					printf("error: nodeID must contain only letters, digits or '_' after '@'\n");
+					printf("error: checkpoints must contain only letters, digits or '_' after '@'\n");
 					return false;
 				}
 			}
@@ -1234,27 +1238,92 @@ bool ParseCommandLine(int argc, char *argv[])
 		}
 	}
 
+	// if (gSaveCheckpoints)
+	// {
+	// 	printf("Checkpoint saving mode is enabled.\n");
+	// 	gRawParams.clear();
+	// 	for (int i = 1; i < argc; ++i)
+	// 	{
+	// 		if (strcmp(argv[i], "-dp") == 0 ||
+	// 			strcmp(argv[i], "-range") == 0 ||
+	// 			strcmp(argv[i], "-start") == 0 ||
+	// 			strcmp(argv[i], "-pubkey") == 0)
+	// 		{
+	// 			if (!gRawParams.empty())
+	// 				gRawParams += " ";
+	// 			gRawParams += argv[i];
+	// 			if ((i + 1) < argc)
+	// 			{
+	// 				gRawParams += " ";
+	// 				gRawParams += argv[i + 1];
+	// 				++i;
+	// 			}
+	// 		}
+	// 	}
+	// }
+
 	if (gSaveCheckpoints)
 	{
 		printf("Checkpoint saving mode is enabled.\n");
 		gRawParams.clear();
+		const char *rangeVal = nullptr;
+		const char *dpVal = nullptr;
+		const char *startVal = nullptr;
+		const char *pubVal = nullptr;
 		for (int i = 1; i < argc; ++i)
 		{
-			if (strcmp(argv[i], "-dp") == 0 ||
-				strcmp(argv[i], "-range") == 0 ||
-				strcmp(argv[i], "-start") == 0 ||
-				strcmp(argv[i], "-pubkey") == 0)
+			if (strcmp(argv[i], "-range") == 0 && (i + 1) < argc)
 			{
-				if (!gRawParams.empty())
-					gRawParams += " ";
-				gRawParams += argv[i];
-				if ((i + 1) < argc)
-				{
-					gRawParams += " ";
-					gRawParams += argv[i + 1];
-					++i;
-				}
+				rangeVal = argv[i + 1];
+				++i;
 			}
+			else if (strcmp(argv[i], "-dp") == 0 && (i + 1) < argc)
+			{
+				dpVal = argv[i + 1];
+				++i;
+			}
+			else if (strcmp(argv[i], "-start") == 0 && (i + 1) < argc)
+			{
+				startVal = argv[i + 1];
+				++i;
+			}
+			else if (strcmp(argv[i], "-pubkey") == 0 && (i + 1) < argc)
+			{
+				pubVal = argv[i + 1];
+				++i;
+			}
+		}
+		bool first = true;
+		if (rangeVal)
+		{
+			if (!first)
+				gRawParams += " ";
+			gRawParams += "-range ";
+			gRawParams += rangeVal;
+			first = false;
+		}
+		if (dpVal)
+		{
+			if (!first)
+				gRawParams += " ";
+			gRawParams += "-dp ";
+			gRawParams += dpVal;
+			first = false;
+		}
+		if (startVal)
+		{
+			if (!first)
+				gRawParams += " ";
+			gRawParams += "-start ";
+			gRawParams += startVal;
+			first = false;
+		}
+		if (pubVal)
+		{
+			if (!first)
+				gRawParams += " ";
+			gRawParams += "-pubkey ";
+			gRawParams += pubVal;
 		}
 	}
 
@@ -1360,7 +1429,7 @@ int main(int argc, char *argv[])
 	printf("********************************************************************************\r\n");
 	printf("*                                                                              *\r\n");
 	printf("*                         Kangaroo v%-4s(c) 2025                               *\r\n", gSoftVersion.c_str());
-	printf("*                                POOL MODE                                     *\r\n");
+	printf("*                             SAVE WORK MODE                                   *\r\n");
 	printf("*                                                                              *\r\n");
 	printf("********************************************************************************\r\n\r\n");
 
