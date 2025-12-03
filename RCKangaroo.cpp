@@ -59,7 +59,7 @@ int gProgressIntervalSec;
 
 bool gSaveCheckpoints = false;
 std::string gClientID;
-std::string gSoftVersion = "3.7";
+std::string gSoftVersion = "3.71";
 int gLastCheckpointDay = -1;
 std::string gRawParams;
 #include <ctime>
